@@ -198,17 +198,19 @@ jobs:
           python -m pip install --quiet pillow
           python build.py
 
-      - name: Assemble MP4
-        run: |
+            - name: Assemble MP4
+            
+          run: |
           set -euo pipefail
 
           duration=$(cat output/duration.txt)
           count=$(find output/images -name 'image-*.jpg' | wc -l)
 
           mkdir -p output/frames
+
           for i in $(seq 1 "$count"); do
-            start=$(python -c "print(($i-1)*$duration/$count)")
             length=$(python -c "print($duration/$count)")
+
             ffmpeg -hide_banner -loglevel error -y \
               -loop 1 -framerate 24 -i "output/images/image-$i.jpg" \
               -t "$length" \
@@ -218,18 +220,21 @@ jobs:
           done
 
           for f in output/frames/scene-*.mp4; do
-           printf "file '%s'\n" "frames/$(basename "$f")"
-           done > output/concat.txt
+            printf "file '%s'\n" "frames/$(basename "$f")"
+          done > output/concat.txt
 
           ffmpeg -hide_banner -loglevel error -y \
             -f concat -safe 0 -i output/concat.txt \
             -i output/narration.wav \
+            -stream_loop -1 -i assets/background-music.mp3 \
+            -filter_complex \
+            "[1:a]volume=1.0[narration];[2:a]volume=0.12,afade=t=out:st=$(python -c "print(max(0,float('$duration')-3))"):d=3[music];[narration][music]amix=inputs=2:duration=first:dropout_transition=2[audio]" \
             -vf "subtitles=output/captions.srt:force_style='FontName=Arial,FontSize=22,Outline=2,Shadow=1,Alignment=2,MarginV=55'" \
-            -map 0:v:0 -map 1:a:0 \
+            -map 0:v:0 -map "[audio]" \
             -c:v libx264 -preset ultrafast -crf 23 \
             -c:a aac -b:a 160k -shortest \
             -movflags +faststart output/mystery-documentary.mp4
-
+            
       - name: Upload finished video and source files
         uses: actions/upload-artifact@v4
         with:
