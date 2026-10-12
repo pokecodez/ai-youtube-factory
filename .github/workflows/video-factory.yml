@@ -217,7 +217,9 @@ jobs:
               "output/frames/scene-$i.mp4"
           done
 
-          printf "file '%s'\n" output/frames/scene-*.mp4 > output/concat.txt
+          for f in output/frames/scene-*.mp4; do
+           printf "file '%s'\n" "frames/$(basename "$f")"
+           done > output/concat.txt
 
           ffmpeg -hide_banner -loglevel error -y \
             -f concat -safe 0 -i output/concat.txt \
