@@ -1,16 +1,21 @@
-name: Gemini Script Generation Test
+name: AI YouTube Factory - Generate Script
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: "0 12 * * *"
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   generate-script:
     runs-on: ubuntu-latest
     steps:
-      - name: Generate an original video script
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Generate original script
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
@@ -24,7 +29,7 @@ jobs:
             -d '{
               "contents": [{
                 "parts": [{
-                  "text": "Write an original 60-second mystery documentary script for YouTube. Choose a fascinating real historical mystery, distinguish verified facts from speculation, and do not invent evidence. Include a short title, narration, and three visual suggestions. Use original wording and do not copy existing videos."
+                  "text": "Create an original 60-second YouTube mystery documentary script about a real historical mystery. Include a compelling title, narration of around 130-150 words, and three visual suggestions. Separate verified facts from speculation. Do not invent evidence, copy existing videos, or use misleading claims."
                 }]
               }],
               "generationConfig": {
@@ -35,25 +40,41 @@ jobs:
 
           python -c '
           import json
+          from pathlib import Path
 
           with open("response.json", encoding="utf-8") as f:
               data = json.load(f)
 
           candidates = data.get("candidates", [])
           if not candidates:
-              print(json.dumps(data, indent=2))
-              raise SystemExit("No script was returned.")
+              raise SystemExit("Gemini returned no script.")
 
           parts = candidates[0].get("content", {}).get("parts", [])
-          script = "\n".join(p.get("text", "") for p in parts if "text" in p)
+          script = "\n".join(
+              part.get("text", "")
+              for part in parts
+              if "text" in part
+          )
 
           if not script.strip():
-              raise SystemExit("The response contained no script text.")
+              raise SystemExit("The generated script was empty.")
 
-          with open("script.txt", "w", encoding="utf-8") as f:
-              f.write(script)
-
-          print("SUCCESS: Original script generated.")
-          print()
-          print(script)
+          Path("generated-script.txt").write_text(script, encoding="utf-8")
           '
+
+      - name: Save script to repository
+        run: |
+          set -euo pipefail
+
+          mkdir -p scripts
+          filename="scripts/script-$(date -u +%Y%m%d-%H%M%S).txt"
+          mv generated-script.txt "$filename"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add "$filename"
+          git commit -m "Generate original video script"
+          git push
+
+          echo "Saved script to $filename"
