@@ -357,10 +357,16 @@ jobs:
 
           if [ ! -f "$music" ]; then
             echo "Music file not found: $music"
-            echo "Files found inside Assets:"
             find Assets -maxdepth 2 -type f 2>/dev/null || true
             exit 1
           fi
+
+          echo "Checking music file format..."
+          file "$music"
+          ffprobe -v error -show_entries format=format_name,duration -of default=noprint_wrappers=1 "$music" || {
+            echo "The music file is not readable audio. Upload a valid MP3 or WAV file as Assets/Song."
+            exit 1
+          }
 
           mkdir -p output/frames
 
