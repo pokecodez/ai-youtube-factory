@@ -19,7 +19,7 @@ jobs:
 
           response=$(curl --silent --show-error --fail-with-body \
             --max-time 60 \
-            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent" \
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent"
             -H "x-goog-api-key: ${GEMINI_API_KEY}" \
             -H "Content-Type: application/json" \
             -d '{
