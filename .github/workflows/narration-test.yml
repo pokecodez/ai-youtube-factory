@@ -28,33 +28,23 @@ jobs:
 
           payload = {
               "model": "gemini-3.8-flash-tts",
-              "input": [
-                  {
-                      "type": "user_input",
-                      "content": [
-                          {
-                              "type": "text",
-                              "text": "Welcome to the mystery files. Tonight, we explore a strange historical mystery. The evidence tells part of the story, but some questions remain unanswered.",
-                              "annotations": [
-                                  {
-                                      "type": "speech_metadata",
-                                      "style": "Calm, cinematic British English narration. Clear pronunciation, measured pace, intriguing documentary tone."
-                                  }
-                              ]
-                          }
-                      ]
-                  }
-              ],
+              "input": [{
+                  "type": "user_input",
+                  "content": [{
+                      "type": "text",
+                      "text": "Welcome to the mystery files. Tonight, we explore a strange historical mystery. The evidence tells part of the story, but some questions remain unanswered.",
+                      "annotations": [{
+                          "type": "speech_metadata",
+                          "style": "Calm, cinematic British English narration. Clear pronunciation, measured pace, intriguing documentary tone."
+                      }]
+                  }]
+              }],
               "response_format": {
                   "type": "audio",
                   "mime_type": "audio/wav"
               },
               "generation_config": {
-                  "speech_config": [
-                      {
-                          "voice": "Kore"
-                      }
-                  ]
+                  "speech_config": [{"voice": "Kore"}]
               }
           }
 
@@ -69,26 +59,42 @@ jobs:
           )
 
           if not response.ok:
-              print("TTS API returned an error:")
               print(response.text[:3000])
               response.raise_for_status()
 
           data = response.json()
-          audio = data.get("output_audio", {}).get("data")
+          audio = None
+
+          for step in data.get("steps", []):
+              for item in step.get("content", []):
+                  if item.get("data"):
+                      audio = item["data"]
+                      break
+              if audio:
+                  break
 
           if not audio:
               print(json.dumps(data, indent=2)[:3000])
-              raise SystemExit("No audio data was returned.")
+              raise SystemExit("No audio data was found in the response.")
 
           audio_bytes = base64.b64decode(audio)
 
           if not audio_bytes.startswith(b"RIFF"):
-              raise SystemExit("The returned audio was not a WAV file.")
+              raise SystemExit("Audio was returned, but it is not a WAV file.")
 
-          with open("narration.wav", "wb") as f:
+          os.makedirs("output", exist_ok=True)
+
+          with open("output/narration.wav", "wb") as f:
               f.write(audio_bytes)
 
           print("SUCCESS: Narration generated.")
-          print(f"Audio size: {len(audio_bytes)} bytes")
-          print("File: narration.wav")
+          print(f"Audio size: {len(audio_bytes)} bytes.")
           PY
+
+      - name: Upload narration audio
+        uses: actions/upload-artifact@v4
+        with:
+          name: narration-audio
+          path: output/narration.wav
+          if-no-files-found: error
+          retention-days: 7
