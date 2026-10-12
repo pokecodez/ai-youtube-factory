@@ -1,4 +1,4 @@
-name: Gemini API Test
+name: Gemini Script Generation Test
 
 on:
   workflow_dispatch:
@@ -7,38 +7,53 @@ permissions:
   contents: read
 
 jobs:
-  test-gemini:
+  generate-script:
     runs-on: ubuntu-latest
     steps:
-      - name: List available Gemini models
+      - name: Generate an original video script
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
           set -euo pipefail
 
-          curl --silent --show-error --fail-with-body --max-time 60 \
-            "https://generativelanguage.googleapis.com/v1beta/models" \
+          curl --silent --show-error --fail-with-body --max-time 90 \
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent" \
             -H "x-goog-api-key: ${GEMINI_API_KEY}" \
-            -o models.json
+            -H "Content-Type: application/json" \
+            -o response.json \
+            -d '{
+              "contents": [{
+                "parts": [{
+                  "text": "Write an original 60-second mystery documentary script for YouTube. Choose a fascinating real historical mystery, distinguish verified facts from speculation, and do not invent evidence. Include a short title, narration, and three visual suggestions. Use original wording and do not copy existing videos."
+                }]
+              }],
+              "generationConfig": {
+                "temperature": 0.8,
+                "maxOutputTokens": 1200
+              }
+            }'
 
           python -c '
           import json
 
-          with open("models.json", encoding="utf-8") as f:
+          with open("response.json", encoding="utf-8") as f:
               data = json.load(f)
 
-          models = data.get("models", [])
-          usable = [
-              model["name"]
-              for model in models
-              if "generateContent" in model.get("supportedGenerationMethods", [])
-          ]
+          candidates = data.get("candidates", [])
+          if not candidates:
+              print(json.dumps(data, indent=2))
+              raise SystemExit("No script was returned.")
 
-          if not usable:
-              print("No models supporting text generation were returned.")
-              raise SystemExit(1)
+          parts = candidates[0].get("content", {}).get("parts", [])
+          script = "\n".join(p.get("text", "") for p in parts if "text" in p)
 
-          print("Models available for text generation:")
-          for name in usable:
-              print(name)
+          if not script.strip():
+              raise SystemExit("The response contained no script text.")
+
+          with open("script.txt", "w", encoding="utf-8") as f:
+              f.write(script)
+
+          print("SUCCESS: Original script generated.")
+          print()
+          print(script)
           '
