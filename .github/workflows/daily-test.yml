@@ -1,0 +1,17 @@
+
+name: AI YouTube Factory - Cloud Test
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 12 * * *"
+
+jobs:
+  cloud-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check automation
+        run: |
+          echo "AI YouTube Factory"
+          echo "Cloud automation is working."
+          date -u
