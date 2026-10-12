@@ -1,0 +1,51 @@
+
+name: Gemini API Test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-gemini:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Test Gemini text generation
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          set -euo pipefail
+
+          response=$(curl --silent --show-error --fail-with-body \
+            --max-time 60 \
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent" \
+            -H "x-goog-api-key: ${GEMINI_API_KEY}" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "contents": [{
+                "parts": [{
+                  "text": "Create one original mystery documentary video idea. Give it a short title and a two-sentence premise. Do not copy an existing video."
+                }]
+              }],
+              "generationConfig": {
+                "maxOutputTokens": 200,
+                "temperature": 0.8
+              }
+            }')
+
+          echo "$response" | python -c '
+          import json, sys
+          data = json.load(sys.stdin)
+          candidates = data.get("candidates", [])
+          if not candidates:
+              print("No generated text was returned.")
+              sys.exit(1)
+          parts = candidates[0].get("content", {}).get("parts", [])
+          text = "\n".join(p.get("text", "") for p in parts if "text" in p)
+          if not text.strip():
+              print("The response contained no text.")
+              sys.exit(1)
+          print("Gemini test passed.")
+          print(text)
+          '
