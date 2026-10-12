@@ -1,0 +1,117 @@
+name: AI YouTube Factory - Download Images
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  download-images:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Find and download images
+        run: |
+          set -euo pipefail
+
+          python - <<'PY'
+          import json
+          import os
+          import urllib.parse
+          import urllib.request
+
+          os.makedirs("output/images", exist_ok=True)
+
+          params = urllib.parse.urlencode({
+              "q": "abandoned castle fog",
+              "page_size": 5,
+              "license_type": "commercial"
+          })
+
+          api_url = "https://api.openverse.org/v1/images/?" + params
+          request = urllib.request.Request(
+              api_url,
+              headers={"User-Agent": "AIYouTubeFactory/1.0"}
+          )
+
+          with urllib.request.urlopen(request, timeout=30) as response:
+              results = json.load(response).get("results", [])
+
+          if not results:
+              raise SystemExit("No images found.")
+
+          records = []
+
+          for item in results:
+              image_url = item.get("url")
+              if not image_url:
+                  continue
+
+              try:
+                  req = urllib.request.Request(
+                      image_url,
+                      headers={"User-Agent": "AIYouTubeFactory/1.0"}
+                  )
+
+                  with urllib.request.urlopen(req, timeout=30) as response:
+                      content_type = response.headers.get("Content-Type", "")
+                      image_data = response.read(8 * 1024 * 1024 + 1)
+
+                  if not content_type.startswith("image/"):
+                      print("Skipped non-image:", item.get("title", "Untitled"))
+                      continue
+
+                  if len(image_data) > 8 * 1024 * 1024:
+                      print("Skipped oversized image:", item.get("title", "Untitled"))
+                      continue
+
+                  extension = {
+                      "image/jpeg": ".jpg",
+                      "image/png": ".png",
+                      "image/webp": ".webp",
+                      "image/gif": ".gif"
+                  }.get(content_type.split(";")[0].lower())
+
+                  if not extension:
+                      print("Skipped unsupported image type:", content_type)
+                      continue
+
+                  filename = f"image-{len(records) + 1}{extension}"
+
+                  with open(f"output/images/{filename}", "wb") as file:
+                      file.write(image_data)
+
+                  records.append({
+                      "file": filename,
+                      "title": item.get("title"),
+                      "creator": item.get("creator"),
+                      "license": item.get("license"),
+                      "license_url": item.get("license_url"),
+                      "source": item.get("foreign_landing_url"),
+                      "attribution": item.get("attribution")
+                  })
+
+                  print("Downloaded:", filename)
+
+                  if len(records) == 3:
+                      break
+
+              except Exception as error:
+                  print("Skipped an image:", str(error))
+
+          if not records:
+              raise SystemExit("No downloadable images were found.")
+
+          with open("output/images/attribution.json", "w", encoding="utf-8") as file:
+              json.dump(records, file, indent=2, ensure_ascii=False)
+
+          print(f"SUCCESS: Downloaded {len(records)} images.")
+          PY
+
+      - name: Upload downloaded images
+        uses: actions/upload-artifact@v4
+        with:
+          name: mystery-images
+          path: output/images/
+          if-no-files-found: error
+          retention-days: 7
