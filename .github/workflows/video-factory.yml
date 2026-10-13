@@ -86,8 +86,84 @@ jobs:
           from email.utils import parsedate_to_datetime
           import xml.etree.ElementTree as ET
           from html.parser import HTMLParser
+          from urllib.parse import quote
+
+          class TrendTableParser(HTMLParser):
+              def __init__(self):
+                  super().__init__(convert_charrefs=True)
+                  self.in_row = False
+                  self.in_cell = False
+                  self.cell_parts = []
+                  self.cells = []
+                  self.rows = []
+              def handle_starttag(self, tag, attrs):
+                  tag = tag.lower()
+                  if tag == "tr":
+                      self.in_row = True
+                      self.cells = []
+                  elif tag in ("td", "th") and self.in_row:
+                      self.in_cell = True
+                      self.cell_parts = []
+              def handle_data(self, data):
+                  if self.in_cell:
+                      value = data.strip()
+                      if value:
+                          self.cell_parts.append(value)
+              def handle_endtag(self, tag):
+                  tag = tag.lower()
+                  if tag in ("td", "th") and self.in_cell:
+                      self.cells.append(" ".join(self.cell_parts).strip())
+                      self.in_cell = False
+                      self.cell_parts = []
+                  elif tag == "tr" and self.in_row:
+                      if self.cells:
+                          self.rows.append(self.cells[:])
+                      self.in_row = False
+                      self.cells = []
+
+          trend_signals = []
+          trend_pages = [
+              ("vidIQ YouTube search trends", "https://vidiq.com/youtube-trending/"),
+              ("UK YouTube trending videos", "https://kworb.net/youtube/trending/uk.html"),
+          ]
+          for trend_source, trend_url in trend_pages:
+              try:
+                  trend_response = requests.get(
+                      trend_url,
+                      headers={"User-Agent": "Mozilla/5.0 (compatible; SignalBrief/1.0)"},
+                      timeout=18
+                  )
+                  trend_response.raise_for_status()
+                  trend_parser = TrendTableParser()
+                  trend_parser.feed(trend_response.text[:2000000])
+                  found_here = 0
+                  for row in trend_parser.rows:
+                      nonempty = [re.sub(r"\s+", " ", clean).strip() for clean in row if clean.strip()]
+                      if len(nonempty) < 2:
+                          continue
+                      candidate = max(nonempty[1:], key=len)
+                      if len(candidate) < 8 or len(candidate) > 180:
+                          continue
+                      if candidate.lower() in {"topic", "video", "trending topic", "title"}:
+                          continue
+                      if not any(ch.isalpha() for ch in candidate):
+                          continue
+                      if candidate not in trend_signals:
+                          trend_signals.append(candidate)
+                          found_here += 1
+                      if found_here >= 18:
+                          break
+                  print(f"Loaded {found_here} YouTube trend signals from {trend_source}.")
+              except Exception as error:
+                  print(f"Trend source unavailable ({trend_source}): {error}")
 
           now = datetime.now(timezone.utc)
+          feeds = list(feeds)
+          for trend in trend_signals[:6]:
+              feeds.append((
+                  "YouTube trend research: " + trend[:70],
+                  "https://news.google.com/rss/search?q=" + quote(trend + " when:7d") + "&hl=en-GB&gl=GB&ceid=GB:en"
+              ))
           news_items = []
           for source_name, feed_url in feeds:
               try:
@@ -169,10 +245,36 @@ jobs:
               item["corroborating"] = corroborating
               item["story_score"] = len({other["source"] for other in corroborating})
 
-          selected_item = max(
-              news_items,
-              key=lambda item: (item["published_dt"] >= now - timedelta(hours=24), item["story_score"], item["published_dt"])
-          )
+          trend_research_items = []
+          for item in news_items:
+              if not item["source"].startswith("YouTube trend research:"):
+                  continue
+              trend_phrase = item["source"].split(":", 1)[1]
+              trend_words = headline_tokens(trend_phrase)
+              headline_words = headline_tokens(item["headline"])
+              overlap = len(trend_words & headline_words) / max(1, len(trend_words))
+              if overlap >= 0.2:
+                  trend_research_items.append(item)
+          if trend_research_items:
+              selected_item = max(
+                  trend_research_items,
+                  key=lambda item: (
+                      item["published_dt"] >= now - timedelta(hours=24),
+                      item["story_score"],
+                      item["published_dt"]
+                  )
+              )
+              print("Prioritising a current YouTube trend with recent reporting: " + selected_item["headline"])
+          else:
+              selected_item = max(
+                  news_items,
+                  key=lambda item: (
+                      item["published_dt"] >= now - timedelta(hours=24),
+                      item["story_score"],
+                      item["published_dt"]
+                  )
+              )
+              print("No trend had accessible recent reporting; using the strongest current news story.")
           related_items = [selected_item] + selected_item["corroborating"]
           related_items = sorted(related_items, key=lambda item: item["published_dt"], reverse=True)[:6]
           topic = selected_item["headline"]
@@ -241,8 +343,13 @@ jobs:
           Selected story: {topic}
           Current UTC date: {now.strftime('%Y-%m-%d')}
 
-          SOURCE MATERIAL (headlines, summaries, publication dates and URLs from live news feeds):
+          CURRENT YOUTUBE TREND SIGNALS (UK, for topic discovery only; not evidence of factual claims):
+          {json.dumps(trend_signals[:25], ensure_ascii=False)}
+
+          SOURCE MATERIAL (headlines, summaries, publication dates and URLs from live news feeds and searches prompted by current YouTube trends):
           {research}
+
+          Prefer a topic connected to a current YouTube trend when the supplied recent reporting genuinely supports it. If no trend has reliable recent reporting, use the strongest current story in the source material. Never claim a topic is trending or viral based only on a single trend listing, and never invent view counts or popularity statistics.
 
           Write 650–800 spoken words in natural British English. Aim for about 725 words, and never return fewer than 600 words. Open with the most important verified
           development and its date. Explain what happened, who is involved, why it matters now, what is
@@ -394,7 +501,7 @@ jobs:
           PASSAGES:
           """
           script_words = script.split()
-          chunk_size = 7
+          chunk_size = 14
           scene_count = (len(script_words) + chunk_size - 1) // chunk_size
           passages = []
           for index in range(scene_count):
@@ -504,7 +611,7 @@ jobs:
                   "https://commons.wikimedia.org/w/api.php",
                   params=params,
                   headers={"User-Agent": "SignalBrief/1.0 (news video with source attribution)"},
-                  timeout=45
+                  timeout=18
               )
               response.raise_for_status()
               pages = response.json().get("query", {}).get("pages", {}).values()
@@ -561,73 +668,99 @@ jobs:
           scene_manifest = []
           used_titles = set()
 
+          def scene_search_queries(search_query, scene_title, passage_text):
+              passage_terms = sorted(tokens(passage_text))
+              topic_terms = sorted(tokens(topic))
+              variants = [
+                  search_query,
+                  scene_title,
+                  " ".join(passage_terms[:5]),
+                  " ".join(topic_terms[:4]),
+                  " ".join((topic_terms + passage_terms)[:6]),
+              ]
+              result = []
+              for value in variants:
+                  value = re.sub(r"\s+", " ", value).strip()
+                  if len(tokens(value)) >= 2 and value.lower() not in {x.lower() for x in result}:
+                      result.append(value)
+              return result[:5]
+
           for scene_index, passage in enumerate(passages, start=1):
               planned = scene_by_index.get(scene_index, {})
-              scene_title = clean_text(planned.get("title", "")) or f"Documentary scene {scene_index}"
+              scene_title = clean_text(planned.get("title", "")) or f"Story context {scene_index}"
               search_query = clean_text(planned.get("query", ""))
               if len(tokens(search_query)) < 2:
                   search_query = scene_title
-              print(f"Scene {scene_index:02d} image search: {search_query}")
+              queries = scene_search_queries(search_query, scene_title, passage["text"])
+              print(f"Scene {scene_index:02d} image search queries: {queries}")
               selected = None
-              try:
-                  for candidate in image_candidates(search_query):
-                      if candidate["title"] in used_titles:
-                          continue
+              candidate_pool = []
+              for query_index, candidate_query in enumerate(queries, start=1):
+                  for attempt in range(2):
                       try:
-                          request = urllib.request.Request(
-                              candidate["url"],
-                              headers={"User-Agent": "SignalBrief/1.0"}
-                          )
-                          with urllib.request.urlopen(request, timeout=30) as image_response:
-                              content_type = image_response.headers.get(
-                                  "Content-Type", ""
-                              ).split(";")[0].lower()
-                              raw = image_response.read(8 * 1024 * 1024 + 1)
-                          if content_type not in ("image/jpeg", "image/png", "image/webp"):
-                              continue
-                          if len(raw) > 8 * 1024 * 1024:
-                              continue
-                          image = Image.open(io.BytesIO(raw))
-                          image.load()
-                          if image.width < 800 or image.height < 450:
-                              continue
-                          filename = f"image-{scene_index}.jpg"
-                          image.convert("RGB").save(images / filename, quality=91)
-                          candidate["file"] = filename
-                          candidate["scene"] = scene_index
-                          candidate["search_query"] = search_query
-                          selected = candidate
-                          used_titles.add(candidate["title"])
-                          print(
-                              f"Matched scene {scene_index:02d}: "
-                              f"{candidate['title']} (score {candidate['match_score']})"
-                          )
+                          candidates = image_candidates(candidate_query)
+                          candidate_pool.extend(candidates)
+                          if candidates:
+                              print(f"Found {len(candidates)} candidate images for '{candidate_query}'.")
                           break
                       except Exception as error:
-                          print("Skipping candidate:", str(error))
-              except Exception as error:
-                  print(f"Image search failed for scene {scene_index}: {error}")
+                          print(
+                              f"Image search attempt {attempt + 1}/2 failed for scene "
+                              f"{scene_index}, query '{candidate_query}': {error}"
+                          )
+                          if attempt == 0:
+                              time.sleep(2)
+                  if candidate_pool:
+                      candidate_pool.sort(key=lambda candidate: candidate.get("match_score", 0), reverse=True)
+                      for candidate in candidate_pool:
+                          if candidate["title"] in used_titles:
+                              continue
+                          try:
+                              request = urllib.request.Request(
+                                  candidate["url"],
+                                  headers={"User-Agent": "Mozilla/5.0 (compatible; SignalBrief/1.0)"}
+                              )
+                              with urllib.request.urlopen(request, timeout=20) as image_response:
+                                  content_type = image_response.headers.get(
+                                      "Content-Type", ""
+                                  ).split(";")[0].lower()
+                                  raw = image_response.read(8 * 1024 * 1024 + 1)
+                              if content_type not in ("image/jpeg", "image/png", "image/webp"):
+                                  continue
+                              if len(raw) > 8 * 1024 * 1024:
+                                  continue
+                              image = Image.open(io.BytesIO(raw))
+                              image.load()
+                              if image.width < 800 or image.height < 450:
+                                  continue
+                              filename = f"image-{scene_index}.jpg"
+                              image.convert("RGB").save(images / filename, quality=91)
+                              candidate["file"] = filename
+                              candidate["scene"] = scene_index
+                              candidate["search_query"] = candidate_query
+                              selected = candidate
+                              used_titles.add(candidate["title"])
+                              print(
+                                  f"Matched scene {scene_index:02d}: "
+                                  f"{candidate['title']} (score {candidate['match_score']})"
+                              )
+                              break
+                          except Exception as error:
+                              print("Skipping candidate image:", str(error))
+                      if selected:
+                          break
+                  if query_index < len(queries):
+                      time.sleep(1)
 
-              if selected:
-                  attribution.append(selected)
-                  visual_kind = "commons"
-              else:
-                  filename = f"image-{scene_index}.jpg"
-                  make_context_card(images / filename, scene_title, passage["text"])
-                  attribution.append({
-                      "file": filename,
-                      "title": scene_title + " — generated context card",
-                      "creator": "Signal Brief",
-                      "attribution": "Generated contextual graphic; no external image used",
-                      "license": "Generated graphic",
-                      "license_url": "",
-                      "foreign_landing_url": "",
-                      "scene": scene_index,
-                      "search_query": search_query,
-                      "match_score": 0
-                  })
-                  visual_kind = "context_card"
-                  print(f"Scene {scene_index:02d}: no sufficiently relevant licensed image; using context card.")
+              if not selected:
+                  raise SystemExit(
+                      f"No suitable licensed image found for scene {scene_index} after "
+                      f"{len(queries)} search queries and retries. The video will not be rendered "
+                      "or uploaded with a blank/text-card scene. Rerun the workflow to retry." 
+                  )
+
+              attribution.append(selected)
+              visual_kind = "commons"
 
               scene_manifest.append({
                   "index": scene_index,
@@ -708,9 +841,10 @@ jobs:
           script_path = out / "script.txt"
           narration_path = out / "narration.wav"
           attribution_path = out / "attribution.json"
+          scenes_path = out / "scenes.json"
           images_dir = out / "images"
 
-          for path in (script_path, narration_path, attribution_path):
+          for path in (script_path, narration_path, attribution_path, scenes_path):
               if not path.is_file() or path.stat().st_size == 0:
                   raise SystemExit(f"Quality check failed: {path} is missing or empty.")
 
@@ -744,12 +878,16 @@ jobs:
               )
 
           attribution = json.loads(attribution_path.read_text(encoding="utf-8"))
+          scenes = json.loads(scenes_path.read_text(encoding="utf-8"))
           images = sorted(images_dir.glob("image-*.jpg"))
 
-          if len(images) < 3:
+          if not scenes or len(images) != len(scenes):
               raise SystemExit(
-                  f"Quality check failed: only {len(images)} suitable images were downloaded."
+                  f"Quality check failed: {len(scenes)} scenes but {len(images)} images. "
+                  "Every scene must have its own verified image."
               )
+          if any(scene.get("visual_kind") != "commons" for scene in scenes):
+              raise SystemExit("Quality check failed: a scene is missing a licensed Commons image.")
 
           for image in images:
               if image.stat().st_size < 10000:
@@ -764,7 +902,7 @@ jobs:
 
           print(f"Script: {len(words)} words")
           print(f"Narration: {duration:.1f} seconds")
-          print(f"Images: {len(images)}")
+          print(f"Scenes with verified licensed images: {len(images)}")
           print("Pre-production quality checks passed.")
           PY
 
