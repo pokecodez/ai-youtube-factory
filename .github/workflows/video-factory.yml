@@ -37,6 +37,7 @@ jobs:
           import io
           import re
           import html
+          import random
           from pathlib import Path
           from PIL import Image
 
@@ -45,9 +46,49 @@ jobs:
           images = out / "images"
           images.mkdir(parents=True, exist_ok=True)
 
-          prompt = """Write an original short documentary narration about a real historical mystery.
-          Around 120 words. Use verified facts, distinguish speculation from evidence,
-          and avoid fabricated details. Return only the spoken narration."""
+          topics = [
+              "the Mary Celeste and the evidence behind its abandonment",
+              "the disappearance of the Roanoke colony and competing explanations",
+              "the Voynich manuscript and what researchers can actually establish",
+              "the Antikythera mechanism and what it reveals about ancient technology",
+              "the lost Franklin expedition and the evidence recovered afterward",
+              "the Nazca Lines and the leading explanations for their purpose",
+              "the disappearance of the Princes in the Tower and the limits of the evidence",
+              "the eruption of Vesuvius and the clues preserved at Pompeii",
+              "the mystery of the Phaistos Disc and why its writing remains undeciphered",
+              "the real history and evidence surrounding the Green Children of Woolpit",
+              "the fate of the Donner Party, focusing on documented decisions and evidence",
+              "the collapse of the Bronze Age societies and the evidence for multiple causes"
+          ]
+          topic = random.choice(topics)
+
+          prompt = f"""Write an original, engaging long-form YouTube documentary narration about:
+          {topic}
+
+          Target roughly 1,000–1,300 spoken words, with a strong opening mystery or surprising
+          documented fact in the first two sentences. Do not begin with greetings, channel
+          introductions, or generic phrases such as 'throughout history'.
+
+          Structure the narration as a story:
+          - Open with a specific question, scene, or contradiction that creates curiosity.
+          - Establish the real people, place, and historical context clearly.
+          - Reveal evidence in a logical sequence, adding meaningful new information as the
+            story progresses.
+          - Explain the strongest competing interpretations fairly and distinguish confirmed
+            facts from disputed claims and speculation.
+          - Include a few natural curiosity gaps, but resolve them honestly rather than
+            withholding basic information or making misleading promises.
+          - End with a satisfying conclusion explaining what is known, what remains uncertain,
+            and why the mystery matters.
+
+          Quality rules:
+          - Be fact-conscious. Never invent quotations, scenes, dates, sources, or evidence.
+          - Do not present myths or internet rumours as established facts.
+          - Avoid repetitive wording, filler, exaggerated clickbait, and repeated summaries.
+          - Make this narration distinctive, specific to this topic, and suitable for spoken
+            delivery in clear, natural British English.
+          - Return only the spoken narration. Do not include a title, headings, bullet points,
+            citations, stage directions, or notes to the editor."""
 
           response = requests.post(
               "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent",
@@ -56,7 +97,7 @@ jobs:
                   "contents": [{"parts": [{"text": prompt}]}],
                   "generationConfig": {
                       "temperature": 0.7,
-                      "maxOutputTokens": 700
+                      "maxOutputTokens": 2400
                   }
               },
               timeout=90
