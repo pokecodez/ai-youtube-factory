@@ -185,21 +185,46 @@ jobs:
           except Exception as error:
               print(f"Social source unavailable (Reddit popular): {error}")
 
-          # These are topic-discovery searches, not claims that a topic is trending.
-          # Only recent reporting can make a topic eligible for the finished video.
+          # Discover major non-political stories people are discussing online.
+          # These searches are leads, not proof that a topic is trending.
           topic_searches = [
-              "Epstein files social media discussion latest reporting when:7d",
-              "Jeffrey Epstein newly released documents investigation when:7d",
-              "Sean Combs Diddy case viral social media discussion latest reporting when:7d",
-              "Bohemian Grove social media discussion fact check reporting when:7d",
-              "viral controversy being discussed on X TikTok Instagram Reddit when:7d",
-              "online conspiracy claim fact check current reporting when:7d",
-              "TikTok controversy viral discussion news when:7d",
-              "Reddit viral controversy news when:7d",
-              "X Twitter trending controversy news this week when:7d",
-              "Instagram viral controversy news this week when:7d",
+              "Jeffrey Epstein files documents new development latest reporting when:7d",
+              "Sean Combs Diddy case new development latest reporting when:7d",
+              "Bohemian Grove investigation documentary fact check latest reporting when:7d",
+              "major celebrity controversy new development reporting when:7d",
+              "viral influencer controversy investigation latest reporting when:7d",
+              "major true crime case new development reporting when:7d",
+              "internet mystery viral claim fact check reporting when:7d",
+              "celebrity lawsuit court case new development entertainment when:7d",
+              "viral internet scandal documentary investigation when:7d",
+              "major entertainment controversy streaming documentary when:7d",
+              "viral social media claim fact check X TikTok Reddit when:7d",
+              "strange unexplained event viral online discussion verified reporting when:7d",
+              "major technology controversy viral social media reporting when:7d",
+              "major sports or entertainment scandal latest reporting when:7d",
           ]
-          topic_searches.extend(signal + " when:7d" for signal in social_topic_signals[:12])
+
+          def is_political_topic(value):
+              text_value = value.lower()
+              # Explicitly keep the user's requested subject areas eligible.
+              if any(term in text_value for term in ("epstein", "sean combs", "diddy", "bohemian grove")):
+                  return False
+              political_patterns = [
+                  r"\belection(s)?\b", r"\belectoral\b", r"\bpresident(ial)?\b",
+                  r"\bprime minister\b", r"\bparliament(ary)?\b", r"\bcongress(ional)?\b",
+                  r"\bsenate\b", r"\bcongressman\b", r"\bgovernment\b", r"\bminister(s)?\b",
+                  r"\bpolitic(s|al|ian|ians)?\b", r"\bpolitical party\b", r"\bcampaign trail\b",
+                  r"\bvoting\b", r"\bvote(s|d)?\b", r"\bballot(s)?\b", r"\bpolicy debate\b",
+                  r"\bwhite house\b", r"\bdowning street\b", r"\bgeopolitic(s|al)?\b",
+                  r"\bceasefire talks\b", r"\bforeign minister\b", r"\bparliamentary vote\b",
+              ]
+              return any(re.search(pattern, text_value) for pattern in political_patterns)
+
+          topic_searches.extend(
+              signal + " latest reporting when:7d"
+              for signal in social_topic_signals[:18]
+              if not is_political_topic(signal)
+          )
 
           now = datetime.now(timezone.utc)
           feeds = [
@@ -296,32 +321,41 @@ jobs:
               item["corroborating"] = corroborating
               item["story_score"] = len({other["source"] for other in corroborating})
 
-          social_research_items = []
-          for item in news_items:
-              if not item["source"].startswith("Social topic research:"):
-                  continue
-              social_research_items.append(item)
+          social_research_items = [
+              item for item in news_items
+              if item["source"].startswith("Social topic research:")
+              and not is_political_topic(item["headline"] + " " + item["summary"])
+          ]
+
+          # General feeds can corroborate a chosen story, but should not cause
+          # the channel to drift into routine politics or government coverage.
+          non_political_items = [
+              item for item in news_items
+              if not is_political_topic(item["headline"] + " " + item["summary"])
+          ]
+          if not non_political_items:
+              raise SystemExit("No suitable recent non-political story had accessible reporting. Rerun later.")
 
           if social_research_items:
               selected_item = max(
                   social_research_items,
                   key=lambda item: (
-                      item["published_dt"] >= now - timedelta(hours=24),
                       item["story_score"],
+                      item["published_dt"] >= now - timedelta(hours=24),
                       item["published_dt"]
                   )
               )
-              print("Prioritising a recent news story connected to social-media discussion: " + selected_item["headline"])
+              print("Prioritising a recent non-political story connected to online discussion: " + selected_item["headline"])
           else:
               selected_item = max(
-                  news_items,
+                  non_political_items,
                   key=lambda item: (
-                      item["published_dt"] >= now - timedelta(hours=24),
                       item["story_score"],
+                      item["published_dt"] >= now - timedelta(hours=24),
                       item["published_dt"]
                   )
               )
-              print("No social-discussion topic had accessible recent reporting; using the strongest current news story.")
+              print("No eligible social-discussion lead had recent reporting; using the strongest available non-political story.")
           related_items = [selected_item] + selected_item["corroborating"]
           related_items = sorted(related_items, key=lambda item: item["published_dt"], reverse=True)[:6]
           topic = selected_item["headline"]
@@ -396,7 +430,7 @@ jobs:
           SOURCE MATERIAL (recent news reports, dates, summaries, article excerpts and URLs; includes searches around high-discussion topics such as Epstein-related documents, the Diddy case, Bohemian Grove, and other current online controversies):
           {research}
 
-          Choose a topic that people are actively discussing across social platforms, supported by recent reporting. Prefer high-interest public-affairs, celebrity/legal cases, internet controversies, investigations, and viral claims that have a genuine news development. Epstein-related documents, the Sean Combs/Diddy case, and Bohemian Grove are example search areas, not mandatory topics: choose them only if current evidence makes them timely. Use the social discussion signals to discover candidate topics, never as proof that a claim is true. If no social-discussion candidate has credible recent reporting, choose a well-supported current story. Never claim a topic is viral or trending unless multiple supplied signals support that wording, and never invent popularity statistics.
+          Choose a major NON-POLITICAL story that people are actively discussing online, supported by recent reporting. The channel covers internet controversies and mysteries, celebrity and influencer scandals, high-profile criminal/legal cases, viral claims that need fact-checking, entertainment controversies, major documentaries, unusual events, and major technology or culture stories. Epstein-related developments, the Sean Combs/Diddy case, and Bohemian Grove are examples of the kind of story the channel may cover when there is a genuine current development. Do NOT choose elections, party politics, politicians, government policy, routine parliamentary news, or geopolitical debate. Use social discussion signals only to discover candidates, never as proof that a claim is true. If no social-discussion candidate has credible recent reporting, choose the strongest well-supported non-political story. Never claim a topic is viral or trending unless multiple supplied signals support that wording, and never invent popularity statistics.
 
           Write 650–800 spoken words in natural British English. Aim for about 725 words, and never return fewer than 600 words. Open with the most important verified
           development and its date. Explain what happened, who is involved, why it matters now, what is
