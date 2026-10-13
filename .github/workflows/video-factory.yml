@@ -23,14 +23,14 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-          cache: "pip"
+          cache: pip
 
       - name: Install tools
         run: |
           sudo apt-get update
           sudo apt-get install -y ffmpeg
           python -m pip install --upgrade pip
-          python -m pip install --quiet requests pillow "av==14.4.0" "faster-whisper>=1.1.1,<2.0.0" --only-binary=av
+          python -m pip install --quiet requests pillow "av==14.4.0" "faster-whisper==1.1.1" --only-binary=av
 
       - name: Research current news, write narration and match visuals
         env:
@@ -219,6 +219,182 @@ jobs:
                   r"\bprime minister\b", r"\bparliament(ary)?\b", r"\bcongress(ional)?\b",
                   r"\bsenate\b", r"\bcongressman\b", r"\bgovernment\b", r"\bminister(s)?\b",
                   r"\bpolitic(s|al|ian|ians)?\b", r"\bpolitical party\b", r"\bcampaign trail\b",
+                  r"\bvoting\b", r"\bvote(s|d)?\b", r"\bballot(s)?\b", r"\bpolicy debate\b",
+                  r"\bwhite house\b", r"\bdowning street\b", r"\bgeopolitic(s|al)?\b",
+                  r"\bceasefire talks\b", r"\bforeign minister\b", r"\bparliamentary vote\b",
+              ]
+              return any(re.search(pattern, text_value) for pattern in political_patterns)
+          
+          investigative_signal_terms = (
+              "epstein", "diddy", "sean combs", "bohemian grove", "scandal", "conspiracy",
+              "mystery", "fact check", "fact-check", "viral", "controversy", "allegation",
+              "lawsuit", "court", "documents", "leaked", "missing", "alive", "dead",
+              "disappearance", "unsolved", "cover-up", "hoax", "deepfake", "exposed",
+              "investigation", "internet", "celebrity", "influencer", "youtuber", "streamer",
+              "cult", "secret", "hidden", "documentary", "fraud", "case files"
+          )
+          signal_candidates = [
+              signal for signal in social_topic_signals
+              if not is_political_topic(signal)
+              and any(term in signal.lower() for term in investigative_signal_terms)
+              and not any(term in signal.lower() for term in (
+                  "official trailer", "music video", "official video", "new song",
+                  "new album", "minecraft", "gameplay", "reaction compilation",
+                  "fixtures", "premier league", "football", "fc ", "nascar", "snowfall totals",
+                  "tour dates", "transfer news"
+              ))
+          ]
+          topic_searches.extend(
+              signal + " controversy mystery claims evidence social media when:7d"
+              for signal in signal_candidates[:8]
+          )
+          
+          now = datetime.now(timezone.utc)
+          feeds = [
+              ("BBC World", "https://feeds.bbci.co.uk/news/world/rss.xml"),
+              ("BBC UK", "https://feeds.bbci.co.uk/news/uk/rss.xml"),
+              ("The Guardian World", "https://www.theguardian.com/world/rss"),
+              ("The Guardian Technology", "https://www.theguardian.com/technology/rss"),
+              ("NPR World", "https://feeds.npr.org/1004/rss.xml"),
+              ("Al Jazeera News", "https://www.aljazeera.com/xml/rss/all.xml"),
+          ]
+          for search_query in topic_searches[:18]:
+              feeds.append((
+                  "Social topic research: " + search_query.replace(" when:7d", "")[:85],
+                  "https://news.google.com/rss/search?q=" + quote(search_query) + "&hl=en-GB&gl=GB&ceid=GB:en"
+              ))
+          news_items = []
+          for source_name, feed_url in feeds:
+              try:
+                  feed_response = requests.get(
+                      feed_url,
+                      headers={"User-Agent": "SignalBrief/1.0 (current affairs research)"},
+                      timeout=20
+                  )
+                  feed_response.raise_for_status()
+                  root = ET.fromstring(feed_response.content)
+                  entries = root.findall(".//item")
+                  if not entries:
+                      entries = [node for node in root.iter() if node.tag.endswith("entry")]
+                  for entry in entries:
+                      def node_text(names):
+                          for node in entry.iter():
+                              if node.tag.split("}")[-1].lower() in names and node.text:
+                                  return node.text.strip()
+                          return ""
+                      headline = node_text({"title"})
+                      summary = node_text({"description", "summary", "encoded"})
+                      link = ""
+                      for node in entry.iter():
+                          if node.tag.split("}")[-1].lower() == "link":
+                              link = (node.attrib.get("href") or node.text or "").strip()
+                              if link:
+                                  break
+                      published = node_text({"pubdate", "published", "updated", "date"})
+                      try:
+                          published_at = parsedate_to_datetime(published)
+                          if published_at.tzinfo is None:
+                              published_at = published_at.replace(tzinfo=timezone.utc)
+                          published_at = published_at.astimezone(timezone.utc)
+                      except Exception:
+                          try:
+                              published_at = datetime.fromisoformat(published.replace("Z", "+00:00"))
+                              if published_at.tzinfo is None:
+                                  published_at = published_at.replace(tzinfo=timezone.utc)
+                              published_at = published_at.astimezone(timezone.utc)
+                          except Exception:
+                              published_at = now - timedelta(hours=12)
+                      summary = re.sub(r"<[^>]+>", " ", summary)
+                      summary = html.unescape(re.sub(r"\s+", " ", summary)).strip()
+                      if headline and link.startswith("http") and published_at >= now - timedelta(days=30):
+                          news_items.append({
+                              "source": source_name,
+                              "headline": headline,
+                              "summary": summary[:900],
+                              "url": link,
+                              "published": published_at.isoformat(),
+                              "published_dt": published_at,
+                          })
+                  print(f"Loaded current headlines from {source_name}.")
+              except Exception as error:
+                  print(f"News feed unavailable ({source_name}): {error}")
+          
+          unique_items = {}
+          for item in news_items:
+              key_title = re.sub(r"[^a-z0-9 ]", "", item["headline"].lower())
+              unique_items[(item["source"], key_title)] = item
+          news_items = sorted(unique_items.values(), key=lambda item: item["published_dt"], reverse=True)
+          if not news_items:
+              raise SystemExit("No current news feeds were available. Rerun the workflow later.")
+          
+          def headline_tokens(value):
+              ignored = {"the", "and", "for", "with", "from", "that", "this", "says", "after", "over", "into", "amid", "what", "why", "how", "its", "their", "has", "have", "are", "was", "were"}
+              return {word for word in re.findall(r"[a-z0-9]+", value.lower()) if len(word) > 2 and word not in ignored}
+          
+          investigative_terms = (
+              "epstein", "diddy", "sean combs", "bohemian grove", "conspiracy",
+              "mystery", "fact check", "fact-check", "viral claim", "misinformation",
+              "scandal", "controversy", "investigation", "unsealed", "court documents",
+              "leaked", "files", "cover-up", "alive", "missing", "debunked", "myth",
+              "rumour", "rumor", "allegation", "evidence", "secret", "hidden", "hoax",
+              "deepfake", "fraud", "lawsuit", "cult", "internet theory", "social media claim"
+          )
+          routine_entertainment_terms = (
+              "official trailer", "new trailer", "music video", "official video",
+              "new single", "new album", "album release", "release date", "teaser trailer",
+              "box office", "episode recap", "season premiere"
+          )
+          
+          def investigative_relevance(item):
+              combined = (item["headline"] + " " + item["summary"]).lower()
+              score = sum(3 for term in investigative_terms if term in combined)
+              if any(term in combined for term in ("epstein", "diddy", "sean combs", "bohemian grove")):
+                  score += 5
+              if any(term in combined for term in routine_entertainment_terms):
+                  score -= 7
+              return score
+          
+          for item in news_items:
+              own = headline_tokens(item["headline"] + " " + item["summary"])
+              corroborating = []
+              for other in news_items:
+                  if other is item or other["source"] == item["source"]:
+                      continue
+                  other_tokens = headline_tokens(other["headline"] + " " + other["summary"])
+                  overlap = len(own & other_tokens) / max(1, len(own | other_tokens))
+                  if overlap >= 0.22:
+                      corroborating.append(other)
+              item["corroborating"] = corroborating
+              item["story_score"] = len({other["source"] for other in corroborating})
+              item["investigative_relevance"] = investigative_relevance(item)
+          
+          social_research_items = [
+              item for item in news_items
+              if item["source"].startswith("Social topic research:")
+              and not is_political_topic(item["headline"] + " " + item["summary"])
+              and item["investigative_relevance"] >= 3
+          ]
+          
+          # General feeds can corroborate a chosen story, but should not cause
+          # the channel to drift into routine politics or government coverage.
+          non_political_items = [
+              item for item in news_items
+              if not is_political_topic(item["headline"] + " " + item["summary"])
+          ]
+          if not non_political_items:
+              raise SystemExit("No suitable recent non-political story had accessible reporting. Rerun later.")
+          
+          if social_research_items:
+              selected_item = max(
+                  social_research_items,
+                  key=lambda item: (
+                      item["story_score"],
+                      item["investigative_relevance"],
+                      item["published_dt"] >= now - timedelta(hours=24),
+                      item["published_dt"]
+                  )
+              )
+              print("Prioritising an investigative inpaign trail\b",
                   r"\bvoting\b", r"\bvote(s|d)?\b", r"\bballot(s)?\b", r"\bpolicy debate\b",
                   r"\bwhite house\b", r"\bdowning street\b", r"\bgeopolitic(s|al)?\b",
                   r"\bceasefire talks\b", r"\bforeign minister\b", r"\bparliamentary vote\b",
