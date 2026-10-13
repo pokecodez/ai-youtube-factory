@@ -16,7 +16,7 @@ concurrency:
 jobs:
   build-video:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 90
 
     steps:
       - name: Check out repository
@@ -25,9 +25,9 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg
+          sudo apt-get install -y ffmpeg fonts-dejavu-core
           python -m pip install --upgrade pip
-          python -m pip install requests pillow google-api-python-client google-auth google-auth-oauthlib google-auth-httplib2
+          python -m pip install requests pillow google-api-python-client google-auth google-auth-httplib2
 
       - name: Generate and upload video
         env:
@@ -42,18 +42,18 @@ jobs:
           cat > build.py <<'PYTHON'
           import os
           import re
+          import io
           import json
           import time
-          import math
           import wave
-          import struct
+          import base64
           import subprocess
           from pathlib import Path
 
           import requests
           from requests.adapters import HTTPAdapter
           from urllib3.util.retry import Retry
-          from PIL import Image, ImageOps, ImageDraw, ImageFont
+          from PIL import Image, ImageDraw, ImageFont, ImageOps
 
           from google.oauth2.credentials import Credentials
           from googleapiclient.discovery import build
@@ -72,19 +72,18 @@ jobs:
 
           session = requests.Session()
           retry = Retry(
-              total=6,
-              connect=4,
-              read=4,
-              backoff_factor=5,
+              total=3,
+              connect=3,
+              read=3,
+              backoff_factor=2,
               status_forcelist=[429, 500, 502, 503, 504],
               allowed_methods=["GET", "POST"],
               respect_retry_after_header=True
           )
           adapter = HTTPAdapter(max_retries=retry)
           session.mount("https://", adapter)
-          session.mount("http://", adapter)
           session.headers.update({
-              "User-Agent": "AIYouTubeFactory/1.0 (https://github.com/)"
+              "User-Agent": "AIYouTubeFactory/1.0"
           })
 
           def save_text(name, value):
@@ -101,7 +100,7 @@ jobs:
                   json={
                       "contents": [{"parts": [{"text": prompt}]}],
                       "generationConfig": {
-                          "temperature": 0.9,
+                          "temperature": 0.8,
                           "responseMimeType": "application/json"
                       }
                   },
@@ -115,64 +114,72 @@ jobs:
               return json.loads(text)
 
           prompt = """
-          Create a compelling original YouTube mystery documentary episode for
-          a channel called The Midnight Archive.
+          Create an original investigation documentary for a YouTube channel
+          called The Midnight Archive.
+
+          Choose a compelling real historical mystery, unexplained event,
+          missing-person case, disputed historical incident, or strange
+          discovery. Prioritise subjects with a genuine investigation,
+          documented evidence, competing explanations, and an unresolved
+          question worth exploring.
 
           The recurring fictional investigators are Mara Vale, a determined
-          archivist, and Eli Ward, a careful researcher. Their personalities
-          should feel consistent, but this episode must stand on its own.
+          archivist, and Eli Ward, a careful researcher. They may frame the
+          investigation, but never invent real evidence or claim fictional
+          conversations actually happened.
 
-          Choose a fascinating historical mystery or strange real-world event.
-          Treat real historical claims responsibly: do not invent quotations,
-          claim fictional dialogue is real, or present speculation as fact.
-          The investigators and any conversations involving them are fictional.
+          Be responsible with facts. Do not invent quotations, sources,
+          dates, evidence, or claims about real people. Clearly distinguish
+          documented facts from theories and speculation. If a detail is
+          uncertain, say so. The investigators are fictional.
 
-          Write an immersive, suspenseful story with a strong opening hook,
-          escalating discoveries, meaningful character decisions, reversals,
-          and a satisfying ending. Avoid repetitive filler, generic clickbait,
-          and claims that the viewer must watch another video to understand it.
+          Create a gripping opening, establish the case, examine evidence,
+          investigate leads, consider competing explanations, and reach a
+          thoughtful conclusion. Avoid filler and repetitive narration.
 
-          Return valid JSON only in this exact structure:
+          Return valid JSON only in this structure:
           {
-            "title": "A compelling accurate title",
-            "description": "An engaging description including a note that
-              the investigators are fictional where appropriate",
+            "title": "Accurate, intriguing investigation title",
+            "description": "Documentary description and relevant disclosure",
             "scenes": [
               {
-                "narration": "Narration for this scene",
-                "visual_search": "Specific search terms for a relevant real
-                  photograph, historical place, document, or object",
-                "visual_description": "A short cinematic description of
-                  the scene's visual mood"
+                "narration": "Spoken documentary narration",
+                "visual_search": "Exact subject to depict in the scene",
+                "visual_description": "Composition, lighting, location and mood"
               }
             ]
           }
 
           Requirements:
           - Exactly 12 scenes.
-          - Approximately 900 to 1100 words of total narration.
-          - Each scene needs substantial narration, not just one sentence.
-          - Scene 1 must hook the viewer within the first two sentences.
-          - Every scene must move the investigation forward.
-          - Use natural spoken English and short, clear sentences.
-          - Do not include markdown, production instructions, or sound cues
-            inside the narration.
-          - Visual searches must describe concrete things likely to have
-            photographs available in Wikimedia Commons.
-          - Do not ask the image generator to imitate a living artist.
-          - Do not make unsupported claims about real people or events.
+          - Approximately 900 to 1100 words total.
+          - Each scene must advance the investigation.
+          - Scene 1 must immediately establish a compelling mystery.
+          - Use natural spoken English.
+          - Give each scene a distinct visual that matches its narration.
+          - visual_search is an image-generation subject, not web-search keywords.
+          - visual_description must describe concrete visual details.
+          - Use historically appropriate settings, clothing, objects and architecture.
+          - Do not fabricate historical documents or show invented text as evidence.
+          - Images are illustrative reconstructions, not authentic photographs.
+          - Do not include sound cues or production instructions in narration.
+          - Do not use misleading clickbait.
+          - Do not imitate a living artist.
           """
 
-          print("Generating the episode...")
+          print("Generating investigation script...")
           story = gemini_generate(prompt)
 
           if len(story.get("scenes", [])) != 12:
-              raise RuntimeError("The story did not contain exactly 12 scenes.")
+              raise RuntimeError("Expected exactly 12 scenes.")
+
+          if not story.get("title") or not story.get("description"):
+              raise RuntimeError("The story is missing its title or description.")
 
           for scene in story["scenes"]:
               for field in ("narration", "visual_search", "visual_description"):
                   if not isinstance(scene.get(field), str) or not scene[field].strip():
-                      raise RuntimeError("A scene is missing required text.")
+                      raise RuntimeError("A scene is missing " + field)
 
           narration = "\n\n".join(
               scene["narration"].strip() for scene in story["scenes"]
@@ -195,10 +202,14 @@ jobs:
                   params={"key": API_KEY},
                   json={
                       "contents": [{
-                          "parts": [{"text": "Read this narration naturally "
-                                    "in a warm, clear documentary voice. "
-                                    "Use measured pacing and dramatic pauses "
-                                    "where appropriate. Narration: " + text}]
+                          "parts": [{
+                              "text": (
+                                  "Read this narration naturally in a warm, "
+                                  "clear investigative documentary voice. "
+                                  "Use measured pacing and dramatic pauses. "
+                                  "Narration: " + text
+                              )
+                          }]
                       }],
                       "generationConfig": {
                           "responseModalities": ["AUDIO"],
@@ -220,16 +231,12 @@ jobs:
                   for part in candidate.get("content", {}).get("parts", []):
                       inline = part.get("inlineData") or part.get("inline_data")
                       if inline and inline.get("data"):
-                          import base64
                           return base64.b64decode(inline["data"])
 
-              raise RuntimeError(
-                  "Gemini returned no audio. Check the TTS model and API access."
-              )
+              raise RuntimeError("Gemini returned no narration audio.")
 
-          print("Generating narration audio...")
+          print("Generating narration...")
           pcm = generate_audio(narration)
-
           audio_path = ROOT / "narration.wav"
 
           with wave.open(str(audio_path), "wb") as wav:
@@ -238,175 +245,163 @@ jobs:
               wav.setframerate(24000)
               wav.writeframes(pcm)
 
-          def audio_duration(path):
-              with wave.open(str(path), "rb") as wav:
-                  return wav.getnframes() / wav.getframerate()
+          with wave.open(str(audio_path), "rb") as wav:
+              duration = wav.getnframes() / wav.getframerate()
 
-          duration = audio_duration(audio_path)
           if duration <= 0:
-              raise RuntimeError("Narration audio has zero duration.")
+              raise RuntimeError("Narration has zero duration.")
 
           save_text("duration.txt", str(duration))
 
-          def find_image(search_term, index):
-              params = {
-                  "action": "query",
-                  "format": "json",
-                  "generator": "search",
-                  "gsrsearch": "filetype:bitmap " + search_term,
-                  "gsrnamespace": 6,
-                  "gsrlimit": 12,
-                  "prop": "imageinfo",
-                  "iiprop": "url|mime|thumbmime",
-                  "iiurlwidth": 1280
-              }
+          HORDE_API = "https://aihorde.net/api/v2"
+          HORDE_HEADERS = {
+              "apikey": "0000000000",
+              "Client-Agent": "AIYouTubeFactory:1.0:GitHubActions"
+          }
 
-              time.sleep(5)
-              response = session.get(
-                  "https://commons.wikimedia.org/w/api.php",
-                  params=params,
-                  timeout=60
-              )
-              response.raise_for_status()
-              pages = response.json().get("query", {}).get("pages", {})
-
-              candidates = sorted(
-                  pages.values(),
-                  key=lambda page: (
-                      not page.get("title", "").lower().endswith(
-                          (".jpg", ".jpeg", ".png", ".webp")
-                      ),
-                      page.get("title", "")
-                  )
+          def generate_ai_image(scene, index):
+              prompt = (
+                  "prompt: Create a cinematic historical investigation "
+                  "documentary illustration. Wide landscape composition, "
+                  "detailed environment, realistic materials, atmospheric "
+                  "lighting, natural shadows, restrained documentary colours. "
+                  "This is an illustrative reconstruction, not authentic "
+                  "historical evidence. Subject: "
+                  + scene["visual_search"]
+                  + ". Scene direction: "
+                  + scene["visual_description"]
+                  + ". Narrative context: "
+                  + scene["narration"][:350]
+                  + ". Respect the correct historical period, location, "
+                  "clothing and objects. No text, letters, captions, "
+                  "watermarks, logos or collages. "
+                  "negative: blurry, low quality, distorted faces, "
+                  "deformed hands, modern objects in historical scenes, "
+                  "text, watermark, logo, collage"
               )
 
-              for page in candidates:
-                  title = page.get("title", "")
-                  if title in used_titles:
-                      continue
+              client = requests.Session()
+              client.headers.update(HORDE_HEADERS)
+              request_id = None
 
-                  if title.lower().endswith((".pdf", ".djvu", ".svg", ".tif", ".tiff")):
-                      continue
-
-                  info_list = page.get("imageinfo", [])
-                  if not info_list:
-                      continue
-
-                  info = info_list[0]
-                  mime = info.get("mime", "")
-                  thumbmime = info.get("thumbmime", "")
-                  url = info.get("thumburl") or info.get("url", "")
-
-                  if mime not in ("image/jpeg", "image/png", "image/webp"):
-                      continue
-                  if thumbmime and thumbmime not in (
-                      "image/jpeg", "image/png", "image/webp"
-                  ):
-                      continue
-                  if not url.startswith("https://"):
-                      continue
-
-                  try:
-                      time.sleep(2)
-                      image_response = session.get(url, timeout=90)
-                      image_response.raise_for_status()
-
-                      destination = IMAGES / f"image-{index}.jpg"
-                      temporary = IMAGES / f"image-{index}.download"
-                      temporary.write_bytes(image_response.content)
-
-                      with Image.open(temporary) as im:
-                          im.verify()
-
-                      with Image.open(temporary) as im:
-                          if im.format not in ("JPEG", "PNG", "WEBP"):
-                              temporary.unlink(missing_ok=True)
-                              continue
-                          if im.width < 640 or im.height < 360:
-                              temporary.unlink(missing_ok=True)
-                              continue
-                          converted = im.convert("RGB")
-                          converted.save(destination, "JPEG", quality=92)
-
-                      temporary.unlink(missing_ok=True)
-                      used_titles.add(title)
-                      attribution.append({
-                          "scene": index,
-                          "title": title,
-                          "source": "Wikimedia Commons",
-                          "url": "https://commons.wikimedia.org/wiki/"
-                                 + requests.utils.quote(title.replace(" ", "_")),
-                          "license_info": "Check the original Commons page for "
-                                          "the individual image's license and attribution."
-                      })
-                      print(f"Scene {index}: {title}")
-                      return destination
-
-                  except Exception as exc:
-                      print(f"Skipping unusable image {title}: {exc}")
-                      (IMAGES / f"image-{index}.download").unlink(missing_ok=True)
-
-              return None
-
-          used_titles = set()
-          attribution = []
-
-          fallback_terms = [
-              "historical photograph archive building",
-              "old street historical photograph",
-              "historic railway station",
-              "old handwritten letter",
-              "historic village photograph",
-              "old industrial building",
-              "historic map",
-              "historic stone building",
-              "old newspaper archive",
-              "historical landscape photograph",
-              "historic interior room",
-              "historic city photograph"
-          ]
-
-          print("Finding unique scene images...")
-          for index, scene in enumerate(story["scenes"], start=1):
-              search_term = scene["visual_search"].strip()
-              image = None
-
-              for attempt in range(3):
-                  try:
-                      query = search_term if attempt == 0 else fallback_terms[index - 1]
-                      image = find_image(query, index)
-                      if image:
-                          break
-                  except Exception as exc:
-                      print(f"Image search attempt failed for scene {index}: {exc}")
-                      time.sleep(15 * (attempt + 1))
-
-              if image is None:
-                  raise RuntimeError(
-                      f"Could not find a unique usable image for scene {index}. "
-                      "Run the workflow again later."
+              try:
+                  response = client.post(
+                      HORDE_API + "/generate/async",
+                      json={
+                          "prompt": prompt,
+                          "params": {
+                              "width": 768,
+                              "height": 448,
+                              "steps": 20,
+                              "n": 1
+                          },
+                          "nsfw": False,
+                          "censor_nsfw": True,
+                          "r2": True
+                      },
+                      timeout=30
                   )
+                  response.raise_for_status()
+                  request_id = response.json().get("id")
 
-          save_text("attribution.json", json.dumps(attribution, indent=2))
+                  if not request_id:
+                      raise RuntimeError("No generation ID was returned.")
 
-          def get_font(size):
-              choices = [
-                  "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-                  "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf"
-              ]
-              for choice in choices:
-                  if Path(choice).exists():
-                      return ImageFont.truetype(choice, size)
-              return ImageFont.load_default()
+                  print(f"Scene {index}: waiting for free AI image generation...")
+                  deadline = time.monotonic() + 180
 
-          def wrap_words(draw, text, font, max_width):
-              words = text.split()
+                  while time.monotonic() < deadline:
+                      time.sleep(5)
+
+                      check = client.get(
+                          f"{HORDE_API}/generate/check/{request_id}",
+                          timeout=20
+                      )
+                      check.raise_for_status()
+                      status = check.json()
+
+                      if status.get("faulted"):
+                          raise RuntimeError("AI Horde generation failed.")
+
+                      if status.get("done"):
+                          result = client.get(
+                              f"{HORDE_API}/generate/status/{request_id}",
+                              timeout=30
+                          )
+                          result.raise_for_status()
+
+                          generations = result.json().get("generations", [])
+                          if not generations:
+                              raise RuntimeError("No image was returned.")
+
+                          image_url = generations[0].get("img", "")
+                          if not image_url.startswith("https://"):
+                              raise RuntimeError("Invalid generated image URL.")
+
+                          downloaded = client.get(image_url, timeout=45)
+                          downloaded.raise_for_status()
+
+                          with Image.open(io.BytesIO(downloaded.content)) as im:
+                              im.verify()
+
+                          destination = IMAGES / f"image-{index}.jpg"
+
+                          with Image.open(io.BytesIO(downloaded.content)) as im:
+                              converted = im.convert("RGB")
+                              if converted.width < 512 or converted.height < 300:
+                                  raise RuntimeError("Image resolution too low.")
+                              converted.save(destination, "JPEG", quality=92)
+
+                          print(f"Scene {index}: AI image generated.")
+                          return destination
+
+                  raise TimeoutError("Image generation timed out.")
+
+              finally:
+                  client.close()
+
+          def make_fallback_image(scene, index):
+              width, height = 1920, 1080
+              image = Image.new("RGB", (width, height), (15, 19, 26))
+              draw = ImageDraw.Draw(image)
+
+              for x in range(0, width, 60):
+                  draw.line((x, 0, x, height), fill=(25, 32, 42), width=1)
+
+              for y in range(0, height, 60):
+                  draw.line((0, y, width, y), fill=(25, 32, 42), width=1)
+
+              draw.rectangle(
+                  (55, 55, width - 55, height - 55),
+                  outline=(115, 124, 137), width=3
+              )
+
+              try:
+                  font = ImageFont.truetype(
+                      "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 42
+                  )
+                  heading = ImageFont.truetype(
+                      "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 56
+                  )
+              except OSError:
+                  font = ImageFont.load_default()
+                  heading = font
+
+              draw.text((100, 100), "THE MIDNIGHT ARCHIVE",
+                        font=heading, fill=(236, 232, 220))
+              draw.line((100, 190, width - 100, 190),
+                        fill=(115, 124, 137), width=3)
+              draw.text((100, 245), f"CASE FILE  /  SCENE {index:02d}",
+                        font=font, fill=(172, 184, 197))
+
+              subject = scene["visual_search"].strip()
+              words = subject.split()
               lines = []
               current = ""
 
               for word in words:
                   test = (current + " " + word).strip()
-                  if draw.textbbox((0, 0), test, font=font)[2] <= max_width:
+                  if draw.textbbox((0, 0), test, font=font)[2] < width - 220:
                       current = test
                   else:
                       if current:
@@ -415,12 +410,82 @@ jobs:
 
               if current:
                   lines.append(current)
+
+              y = 380
+              for line in lines[:6]:
+                  draw.text((100, y), line, font=font,
+                            fill=(230, 219, 196))
+                  y += 65
+
+              draw.text((100, height - 145),
+                        "ILLUSTRATIVE CASE FILE",
+                        font=font, fill=(172, 184, 197))
+
+              destination = IMAGES / f"image-{index}.jpg"
+              image.save(destination, "JPEG", quality=90)
+              return destination
+
+          attribution = []
+
+          print("Generating matching images for all 12 scenes...")
+
+          for index, scene in enumerate(story["scenes"], start=1):
+              try:
+                  generate_ai_image(scene, index)
+                  source = "AI Horde"
+              except Exception as exc:
+                  print(f"Scene {index}: AI image unavailable: {exc}")
+                  make_fallback_image(scene, index)
+                  source = "Locally generated case-file graphic"
+
+              attribution.append({
+                  "scene": index,
+                  "subject": scene["visual_search"],
+                  "source": source,
+                  "note": (
+                      "AI-generated illustrative reconstruction"
+                      if source == "AI Horde"
+                      else "Fallback graphic; not an AI-generated photograph"
+                  )
+              })
+
+          save_text("attribution.json", json.dumps(attribution, indent=2))
+
+          def get_font(size):
+              paths = [
+                  "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+                  "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf"
+              ]
+              for path in paths:
+                  if Path(path).exists():
+                      return ImageFont.truetype(path, size)
+              return ImageFont.load_default()
+
+          def wrap_words(draw, text, font, max_width):
+              lines = []
+              current = ""
+
+              for word in text.split():
+                  candidate = (current + " " + word).strip()
+                  if draw.textbbox((0, 0), candidate, font=font)[2] <= max_width:
+                      current = candidate
+                  else:
+                      if current:
+                          lines.append(current)
+                      current = word
+
+              if current:
+                  lines.append(current)
+
               return lines
 
-          def make_scene_card(scene, index, start, end):
+          total_words = sum(
+              len(scene["narration"].split()) for scene in story["scenes"]
+          )
+
+          def make_scene_video(scene, index):
               image_path = IMAGES / f"image-{index}.jpg"
               frame_path = SCENES / f"scene-{index}.mp4"
-              caption_path = SCENES / f"caption-{index}.png"
 
               with Image.open(image_path) as original:
                   frame = ImageOps.fit(
@@ -430,45 +495,54 @@ jobs:
                   )
 
               overlay = Image.new("RGBA", frame.size, (0, 0, 0, 0))
-              draw = ImageDraw.Draw(overlay)
-              draw.rectangle((0, 0, 1920, 160), fill=(0, 0, 0, 145))
-              draw.rectangle((0, 880, 1920, 1080), fill=(0, 0, 0, 155))
+              overlay_draw = ImageDraw.Draw(overlay)
+              overlay_draw.rectangle(
+                  (0, 0, 1920, 175), fill=(0, 0, 0, 165)
+              )
+              overlay_draw.rectangle(
+                  (0, 875, 1920, 1080), fill=(0, 0, 0, 175)
+              )
+
               frame = Image.alpha_composite(
                   frame.convert("RGBA"), overlay
               ).convert("RGB")
 
               draw = ImageDraw.Draw(frame)
               title_font = get_font(46)
-              small_font = get_font(28)
+              small_font = get_font(30)
 
-              draw.text((75, 45), "THE MIDNIGHT ARCHIVE",
-                        font=title_font, fill=(255, 255, 255))
-              draw.text((78, 108), f"CASE FILE  /  SCENE {index:02d}",
-                        font=small_font, fill=(225, 225, 225))
+              draw.text(
+                  (75, 45), "THE MIDNIGHT ARCHIVE",
+                  font=title_font, fill=(255, 255, 255)
+              )
+              draw.text(
+                  (78, 112), f"CASE FILE  /  SCENE {index:02d}",
+                  font=small_font, fill=(220, 220, 220)
+              )
 
-              description_lines = wrap_words(
+              lines = wrap_words(
                   draw, scene["visual_description"], small_font, 1750
               )[:3]
-              y = 900
-              for line in description_lines:
-                  draw.text((75, y), line, font=small_font,
-                            fill=(255, 255, 255))
+
+              y = 905
+              for line in lines:
+                  draw.text(
+                      (75, y), line, font=small_font,
+                      fill=(255, 255, 255)
+                  )
                   y += 42
 
-              frame.save(caption_path, "PNG")
+              frame_path_image = SCENES / f"scene-{index}.jpg"
+              frame.save(frame_path_image, "JPEG", quality=93)
 
-              scene_words = len(scene["narration"].split())
-              total_words = sum(
-                  len(s["narration"].split()) for s in story["scenes"]
-              )
-              scene_duration = duration * scene_words / max(total_words, 1)
-              scene_duration = max(scene_duration, 1.0)
+              words = len(scene["narration"].split())
+              scene_duration = max(duration * words / max(total_words, 1), 1.0)
 
               subprocess.run([
                   "ffmpeg", "-y",
                   "-loop", "1",
                   "-framerate", "30",
-                  "-i", str(caption_path),
+                  "-i", str(frame_path_image),
                   "-t", f"{scene_duration:.3f}",
                   "-vf", "scale=1920:1080,format=yuv420p",
                   "-r", "30",
@@ -480,12 +554,12 @@ jobs:
               ], check=True, stdout=subprocess.DEVNULL,
                  stderr=subprocess.PIPE)
 
-              return scene_duration
+              return frame_path
 
-          print("Building scene videos...")
-          scene_durations = []
+          print("Building video scenes...")
+
           for index, scene in enumerate(story["scenes"], start=1):
-              scene_durations.append(make_scene_card(scene, index, 0, 0))
+              make_scene_video(scene, index)
 
           concat_file = SCENES / "concat.txt"
           with concat_file.open("w", encoding="utf-8") as file:
@@ -494,9 +568,11 @@ jobs:
                   file.write("file '" + str(path) + "'\n")
 
           silent_video = ROOT / "silent.mp4"
+
           subprocess.run([
               "ffmpeg", "-y",
-              "-f", "concat", "-safe", "0",
+              "-f", "concat",
+              "-safe", "0",
               "-i", str(concat_file),
               "-c:v", "libx264",
               "-preset", "veryfast",
@@ -506,6 +582,7 @@ jobs:
           ], check=True)
 
           final_video = ROOT / "final-video.mp4"
+
           subprocess.run([
               "ffmpeg", "-y",
               "-i", str(silent_video),
@@ -520,10 +597,8 @@ jobs:
               str(final_video)
           ], check=True)
 
-          print("Writing captions...")
-          total_words = sum(
-              len(scene["narration"].split()) for scene in story["scenes"]
-          )
+          print("Writing subtitles...")
+
           seconds_per_word = duration / max(total_words, 1)
           srt_lines = []
           word_cursor = 0
@@ -537,10 +612,14 @@ jobs:
               milliseconds %= 60000
               secs = milliseconds // 1000
               milliseconds %= 1000
-              return f"{hours:02}:{minutes:02}:{secs:02},{milliseconds:03}"
+              return (
+                  f"{hours:02}:{minutes:02}:"
+                  f"{secs:02},{milliseconds:03}"
+              )
 
           for scene in story["scenes"]:
               words = scene["narration"].split()
+
               for offset in range(0, len(words), 8):
                   chunk = words[offset:offset + 8]
                   start = word_cursor * seconds_per_word
@@ -548,25 +627,27 @@ jobs:
                       (word_cursor + len(chunk)) * seconds_per_word,
                       duration
                   )
-                  srt_lines.append(str(subtitle_index))
-                  srt_lines.append(
-                      f"{timestamp(start)} --> {timestamp(end)}"
-                  )
-                  srt_lines.append(" ".join(chunk))
-                  srt_lines.append("")
+
+                  srt_lines.extend([
+                      str(subtitle_index),
+                      f"{timestamp(start)} --> {timestamp(end)}",
+                      " ".join(chunk),
+                      ""
+                  ])
+
                   word_cursor += len(chunk)
                   subtitle_index += 1
 
           save_text("captions.srt", "\n".join(srt_lines))
-
           save_text(
               "upload-notes.txt",
-              "Images are sourced from Wikimedia Commons. Check attribution.json "
-              "and each original image page to confirm license and attribution "
-              "requirements before publishing."
+              "AI-generated images and fallback graphics are listed in "
+              "attribution.json. Generated illustrations are not authentic "
+              "historical photographs. Verify historical claims before publishing."
           )
 
-          print("Uploading video to YouTube...")
+          print("Connecting to YouTube...")
+
           credentials = Credentials(
               token=None,
               refresh_token=os.environ["YOUTUBE_REFRESH_TOKEN"],
@@ -586,14 +667,16 @@ jobs:
               "snippet": {
                   "title": title[:100],
                   "description": (
-                      description + "\n\n"
-                      "Visual credits and source notes are included in the "
-                      "workflow artifact. Verify image licenses before reuse."
+                      description
+                      + "\n\nThis documentary may contain AI-generated "
+                      "illustrative reconstructions. See the video context "
+                      "for distinctions between historical facts and theories."
                   )[:5000],
-                  "categoryId": "24",
+                  "categoryId": "27",
                   "tags": [
-                      "mystery", "history", "documentary",
-                      "historical mysteries", "The Midnight Archive"
+                      "investigation", "mystery", "history",
+                      "documentary", "historical mysteries",
+                      "The Midnight Archive"
                   ],
                   "defaultLanguage": "en"
               },
@@ -614,6 +697,7 @@ jobs:
           )
 
           result = None
+
           while result is None:
               status, result = upload.next_chunk()
               if status:
@@ -628,7 +712,7 @@ jobs:
 
           print("Upload completed.")
           print("Video ID: " + video_id)
-          print("The video is private until you change its visibility in YouTube Studio.")
+          print("The video is private until you change its visibility.")
           PYTHON
 
           python build.py
