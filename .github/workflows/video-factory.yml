@@ -1,7 +1,10 @@
+
 name: AI YouTube Factory - Build Video
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: "0 16 * * *"
 
 permissions:
   contents: read
@@ -9,7 +12,7 @@ permissions:
 jobs:
   build-video:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 35
 
     steps:
       - name: Check out repository
@@ -19,78 +22,234 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y ffmpeg
-          python -m pip install --quiet requests pillow
+          python -m pip install requests pillow google-api-python-client google-auth google-auth-httplib2
 
-      - name: Generate script, narration and images
+      - name: Generate story, narration and images
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
           set -euo pipefail
-
           cat > build.py <<'PY'
-          import os
-          import json
-          import base64
-          import requests
-          import subprocess
-          import urllib.request
-          import io
-          import re
-          import html
-          import random
+          import os, json, base64, random, subprocess, urllib.parse, urllib.request, io
           from pathlib import Path
+          import requests
           from PIL import Image
 
-          key = os.environ["GEMINI_API_KEY"]
           out = Path("output")
-          images = out / "images"
-          images.mkdir(parents=True, exist_ok=True)
+          imgs = out / "images"
+          imgs.mkdir(parents=True, exist_ok=True)
+          key = os.environ["GEMINI_API_KEY"]
 
           topics = [
-              "the Mary Celeste and the evidence behind its abandonment",
-              "the disappearance of the Roanoke colony and competing explanations",
-              "the Voynich manuscript and what researchers can actually establish",
-              "the Antikythera mechanism and what it reveals about ancient technology",
-              "the lost Franklin expedition and the evidence recovered afterward",
-              "the Nazca Lines and the leading explanations for their purpose",
-              "the disappearance of the Princes in the Tower and the limits of the evidence",
-              "the eruption of Vesuvius and the clues preserved at Pompeii",
-              "the mystery of the Phaistos Disc and why its writing remains undeciphered",
-              "the real history and evidence surrounding the Green Children of Woolpit",
-              "the fate of the Donner Party, focusing on documented decisions and evidence",
-              "the collapse of the Bronze Age societies and the evidence for multiple causes"
+              "The Mary Celeste: what the evidence actually tells us",
+              "The lost Franklin expedition and its final clues",
+              "The Antikythera mechanism: the ancient machine ahead of its time",
+              "The Roanoke colony and the competing explanations",
+              "Pompeii: the final hours reconstructed from archaeological evidence",
+              "The Voynich manuscript and the attempts to decode it",
+              "The Princes in the Tower and the limits of the historical evidence",
+              "The Bronze Age collapse and the interconnected crises behind it",
+              "The real story of the Green Children of Woolpit",
+              "The disappearance of the lighthouse keepers of Flannan Isles"
           ]
           topic = random.choice(topics)
-          (out / "topic.txt").write_text(topic, encoding="utf-8")
+          (out / "topic.txt").write_text(topic)
 
-          prompt = f"""Write an original, engaging long-form YouTube documentary narration about:
-          {topic}
+          prompt = f"""Write a compelling original YouTube historical documentary about: {topic}.
+          Aim for 900-1100 spoken words. Open with a specific intriguing documented fact.
+          Tell the story in a clear chronological progression, introduce evidence gradually,
+          explain credible competing theories, distinguish facts from speculation, and end
+          with a satisfying conclusion. Natural British English. No greetings, headings,
+          fabricated quotes, invented evidence, citations or stage directions.
+          Return only the spoken narration."""
 
-          Target roughly 1,000–1,300 spoken words, with a strong opening mystery or surprising
-          documented fact in the first two sentences. Do not begin with greetings, channel
-          introductions, or generic phrases such as 'throughout history'.
-
-          Structure the narration as a story:
-          - Open with a specific question, scene, or contradiction that creates curiosity.
-          - Establish the real people, place, and historical context clearly.
-          - Reveal evidence in a logical sequence, adding meaningful new information as the
-            story progresses.
-          - Explain the strongest competing interpretations fairly and distinguish confirmed
-            facts from disputed claims and speculation.
-          - Include a few natural curiosity gaps, but resolve them honestly rather than
-            withholding basic information or making misleading promises.
-          - End with a satisfying conclusion explaining what is known, what remains uncertain,
-            and why the mystery matters.
-
-          Quality rules:
-          - Be fact-conscious. Never invent quotations, scenes, dates, sources, or evidence.
-          - Do not present myths or internet rumours as established facts.
-          - Avoid repetitive wording, filler, exaggerated clickbait, and repeated summaries.
-          - Make this narration distinctive, specific to this topic, and suitable for spoken
-            delivery in clear, natural British English.
-          - Return only the spoken narration. Do not include a title, headings, bullet points,
-            citations, stage directions, or notes to the editor."""
-
-          response = requests.post(
+          r = requests.post(
               "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent",
               headers={"x-goog-api-key": key},
+              json={"contents":[{"parts":[{"text":prompt}]}],
+                    "generationConfig":{"temperature":0.8,"maxOutputTokens":5000}},
+              timeout=120)
+          r.raise_for_status()
+          data = r.json()
+          script = "".join(p.get("text","") for p in data["candidates"][0]["content"]["parts"]).strip()
+          if len(script.split()) < 400:
+              raise SystemExit("Story was too short. Run the workflow again.")
+          (out / "script.txt").write_text(script, encoding="utf-8")
+
+          payload = {
+              "model":"gemini-3.8-flash-tts",
+              "input":[{"type":"user_input","content":[{"type":"text","text":script,
+                  "annotations":[{"type":"speech_metadata","style":"Clear, calm, cinematic British English documentary narration, natural pace"}]}]}],
+              "response_format":{"type":"audio","mime_type":"audio/wav"},
+              "generation_config":{"speech_config":[{"voice":"Kore"}]}
+          }
+          r = requests.post(
+              "https://generativelanguage.googleapis.com/v1beta/interactions",
+              headers={"x-goog-api-key":key,"Content-Type":"application/json"},
+              json=payload, timeout=240)
+          r.raise_for_status()
+          audio = next((item["data"] for step in r.json().get("steps",[])
+                        for item in step.get("content",[]) if item.get("data")), None)
+          if not audio:
+              raise SystemExit("No narration audio returned.")
+          wav = base64.b64decode(audio)
+          if not wav.startswith(b"RIFF"):
+              raise SystemExit("Narration was not WAV audio.")
+          (out / "narration.wav").write_bytes(wav)
+
+          params = urllib.parse.urlencode({
+              "q":topic + " historical photograph archaeology museum",
+              "page_size":30,
+              "license":"cc0"
+          })
+          req = urllib.request.Request(
+              "https://commons.wikimedia.org/w/api.php?action=query&generator=search&gsrsearch="
+              + urllib.parse.quote(topic + " historical photograph archaeology")
+              + "&gsrnamespace=6&gsrlimit=30&prop=imageinfo&iiprop=url|extmetadata&iiurlwidth=1920&format=json",
+              headers={"User-Agent":"YouTubeStoryFactory/1.0 (video production)"})
+          try:
+              with urllib.request.urlopen(req,timeout=40) as resp:
+                  pages = json.load(resp).get("query",{}).get("pages",{})
+          except Exception as e:
+              raise SystemExit("Wikimedia image search failed: " + str(e))
+
+          credits = []
+          for page in pages.values():
+              if len(credits) >= 6:
+                  break
+              info = (page.get("imageinfo") or [{}])[0]
+              url = info.get("thumburl") or info.get("url","")
+              if not url.startswith("https://"):
+                  continue
+              try:
+                  rr = requests.get(url, timeout=30, headers={"User-Agent":"YouTubeStoryFactory/1.0"})
+                  rr.raise_for_status()
+                  im = Image.open(io.BytesIO(rr.content)).convert("RGB")
+                  if im.width < 640 or im.height < 360:
+                      continue
+                  name = f"image-{len(credits)+1}.jpg"
+                  im.save(imgs/name,quality=88)
+                  meta = info.get("extmetadata",{})
+                  credits.append({
+                      "file":name,
+                      "title":page.get("title","Historical image"),
+                      "artist":meta.get("Artist",{}).get("value","Unknown"),
+                      "license":meta.get("LicenseShortName",{}).get("value","Check source"),
+                      "source":page.get("title","")
+                  })
+              except Exception as e:
+                  print("Skipping image:",str(e))
+
+          if not credits:
+              raise SystemExit("No usable Wikimedia images found.")
+          (out/"attribution.json").write_text(json.dumps(credits,indent=2),encoding="utf-8")
+
+          duration = float(subprocess.check_output([
+              "ffprobe","-v","error","-show_entries","format=duration",
+              "-of","default=noprint_wrappers=1:nokey=1",str(out/"narration.wav")
+          ],text=True).strip())
+          (out/"duration.txt").write_text(str(duration))
+
+          words = script.split()
+          groups = [words[i:i+7] for i in range(0,len(words),7)]
+          def stamp(t):
+              ms = int(t*1000)
+              h,ms = divmod(ms,3600000)
+              m,ms = divmod(ms,60000)
+              s,ms = divmod(ms,1000)
+              return f"{h:02}:{m:02}:{s:02},{ms:03}"
+          with open(out/"captions.srt","w",encoding="utf-8") as f:
+              for i,g in enumerate(groups):
+                  f.write(f"{i+1}\n{stamp(duration*i/len(groups))} --> {stamp(duration*(i+1)/len(groups))}\n{' '.join(g)}\n\n")
+
+          title = topic[:95]
+          (out/"title.txt").write_text(title)
+          (out/"description.txt").write_text(
+              f"{topic}\n\nAn original historical documentary exploring the evidence, context and competing explanations.\n\n"
+              + "\n".join(f"{c['title']} — {c['license']} — {c['source']}" for c in credits)
+              + "\n\nNarration generated with AI; historical claims should be checked against reliable sources.",
+              encoding="utf-8")
+          print("Story, narration, images and captions ready.")
+          PY
+          python build.py
+
+      - name: Assemble finished MP4
+        run: |
+          set -euo pipefail
+          duration=$(cat output/duration.txt)
+          count=$(find output/images -maxdepth 1 -name 'image-*.jpg' | wc -l)
+          mkdir -p output/frames
+
+          for i in $(seq 1 "$count"); do
+            length=$(python -c "print(float('$duration')/$count)")
+            ffmpeg -hide_banner -loglevel error -y \
+              -loop 1 -framerate 24 -i "output/images/image-$i.jpg" \
+              -t "$length" \
+              -vf "scale=1920:1080:force_original_aspect_ratio=increase,crop=1920:1080,zoompan=z='min(zoom+0.0005,1.08)':d=1:s=1920x1080:fps=24,setsar=1" \
+              -an -c:v libx264 -pix_fmt yuv420p "output/frames/scene-$i.mp4"
+          done
+
+          for f in output/frames/scene-*.mp4; do
+            printf "file '%s'\n" "$PWD/$f"
+          done > output/concat.txt
+
+          ffmpeg -hide_banner -loglevel error -y \
+            -f concat -safe 0 -i output/concat.txt -i output/narration.wav \
+            -vf "subtitles=output/captions.srt:force_style='FontName=Arial,FontSize=22,Outline=2,Shadow=1,Alignment=2,MarginV=55'" \
+            -map 0:v:0 -map 1:a:0 -c:v libx264 -preset ultrafast -crf 23 \
+            -c:a aac -b:a 160k -shortest -movflags +faststart \
+            output/mystery-documentary.mp4
+          test -s output/mystery-documentary.mp4
+          ffprobe -v error output/mystery-documentary.mp4
+
+      - name: Upload video to YouTube as private
+        env:
+          YOUTUBE_CLIENT_ID: ${{ secrets.YOUTUBE_CLIENT_ID }}
+          YOUTUBE_CLIENT_SECRET: ${{ secrets.YOUTUBE_CLIENT_SECRET }}
+          YOUTUBE_REFRESH_TOKEN: ${{ secrets.YOUTUBE_REFRESH_TOKEN }}
+        run: |
+          set -euo pipefail
+          cat > upload.py <<'PY'
+          import os
+          from pathlib import Path
+          from google.oauth2.credentials import Credentials
+          from googleapiclient.discovery import build
+          from googleapiclient.http import MediaFileUpload
+
+          out = Path("output")
+          credentials = Credentials(
+              token=None,
+              refresh_token=os.environ["YOUTUBE_REFRESH_TOKEN"],
+              token_uri="https://oauth2.googleapis.com/token",
+              client_id=os.environ["YOUTUBE_CLIENT_ID"],
+              client_secret=os.environ["YOUTUBE_CLIENT_SECRET"],
+              scopes=["https://www.googleapis.com/auth/youtube.upload"])
+          youtube = build("youtube","v3",credentials=credentials)
+          title = (out/"title.txt").read_text().strip()[:100]
+          description = (out/"description.txt").read_text().strip()[:4900]
+          request = youtube.videos().insert(
+              part="snippet,status",
+              body={"snippet":{"title":title,"description":description,
+                               "categoryId":"27"},
+                    "status":{"privacyStatus":"private","selfDeclaredMadeForKids":False}},
+              media_body=MediaFileUpload(
+                  str(out/"mystery-documentary.mp4"),
+                  mimetype="video/mp4",resumable=True,chunksize=8*1024*1024))
+          result = None
+          while result is None:
+              status, result = request.next_chunk()
+              if status:
+                  print(f"Upload progress: {int(status.progress()*100)}%")
+          print("Uploaded video ID:",result["id"])
+          print("YouTube Studio: https://studio.youtube.com/")
+          PY
+          python upload.py
+
+      - name: Save video and project files
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mystery-documentary-video
+          path: output/
+          if-no-files-found: warn
+          retention-days: 7
