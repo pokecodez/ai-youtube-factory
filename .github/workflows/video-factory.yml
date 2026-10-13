@@ -1,3 +1,323 @@
+name: AI YouTube Factory - Build Video
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-video:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          python -m pip install --quiet requests pillow
+
+      - name: Generate script, narration and images
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          set -euo pipefail
+
+          cat > build.py <<'PY'
+          import os
+          import json
+          import base64
+          import requests
+          import subprocess
+          import urllib.request
+          import io
+          import re
+          import html
+          from pathlib import Path
+          from PIL import Image
+
+          key = os.environ["GEMINI_API_KEY"]
+          out = Path("output")
+          images = out / "images"
+          images.mkdir(parents=True, exist_ok=True)
+
+          prompt = """Write an original short documentary narration about a real historical mystery.
+          Around 120 words. Use verified facts, distinguish speculation from evidence,
+          and avoid fabricated details. Return only the spoken narration."""
+
+          response = requests.post(
+              "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent",
+              headers={"x-goog-api-key": key},
+              json={
+                  "contents": [{"parts": [{"text": prompt}]}],
+                  "generationConfig": {
+                      "temperature": 0.7,
+                      "maxOutputTokens": 700
+                  }
+              },
+              timeout=90
+          )
+          response.raise_for_status()
+          data = response.json()
+          script = "".join(
+              part.get("text", "")
+              for part in data["candidates"][0]["content"]["parts"]
+          ).strip()
+
+          if not script:
+              raise SystemExit("Script generation returned empty text.")
+
+          (out / "script.txt").write_text(script, encoding="utf-8")
+          print("Script generated.")
+
+          payload = {
+              "model": "gemini-3.8-flash-tts",
+              "input": [{
+                  "type": "user_input",
+                  "content": [{
+                      "type": "text",
+                      "text": script,
+                      "annotations": [{
+                          "type": "speech_metadata",
+                          "style": "Calm, cinematic British English documentary narration. Clear pronunciation and measured pace."
+                      }]
+                  }]
+              }],
+              "response_format": {
+                  "type": "audio",
+                  "mime_type": "audio/wav"
+              },
+              "generation_config": {
+                  "speech_config": [{"voice": "Kore"}]
+              }
+          }
+
+          response = requests.post(
+              "https://generativelanguage.googleapis.com/v1beta/interactions",
+              headers={
+                  "x-goog-api-key": key,
+                  "Content-Type": "application/json"
+              },
+              json=payload,
+              timeout=180
+          )
+
+          if not response.ok:
+              print(response.text[:2000])
+              response.raise_for_status()
+
+          audio = None
+          for step in response.json().get("steps", []):
+              for item in step.get("content", []):
+                  if item.get("data"):
+                      audio = item["data"]
+                      break
+              if audio:
+                  break
+
+          if not audio:
+              raise SystemExit("No narration audio returned.")
+
+          audio_bytes = base64.b64decode(audio)
+
+          if not audio_bytes.startswith(b"RIFF"):
+              raise SystemExit("Narration was not returned as WAV audio.")
+
+          (out / "narration.wav").write_bytes(audio_bytes)
+          print("Narration generated.")
+
+          search_terms = [
+              "historical castle ruins",
+              "ancient archaeological ruins",
+              "medieval abandoned building"
+          ]
+
+          results = []
+          seen_titles = set()
+
+          for search_term in search_terms:
+              params = {
+                  "action": "query",
+                  "generator": "search",
+                  "gsrsearch": search_term,
+                  "gsrnamespace": 6,
+                  "gsrlimit": 30,
+                  "prop": "imageinfo",
+                  "iiprop": "url|extmetadata",
+                  "iiurlwidth": 1920,
+                  "format": "json"
+              }
+
+              response = requests.get(
+                  "https://commons.wikimedia.org/w/api.php",
+                  params=params,
+                  headers={
+                      "User-Agent": "AIYouTubeFactory/1.0 (video production)"
+                  },
+                  timeout=45
+              )
+              response.raise_for_status()
+
+              pages = response.json().get("query", {}).get("pages", {})
+
+              for page in pages.values():
+                  title = page.get("title", "")
+
+                  if title in seen_titles:
+                      continue
+
+                  seen_titles.add(title)
+
+                  image_info = page.get("imageinfo", [])
+                  if not image_info:
+                      continue
+
+                  info = image_info[0]
+                  metadata = info.get("extmetadata", {})
+
+                  def metadata_value(name):
+                      value = metadata.get(name, {}).get("value", "")
+                      value = re.sub(r"<[^>]*>", "", str(value))
+                      return html.unescape(value).strip()
+
+                  license_name = metadata_value("LicenseShortName")
+                  license_url = metadata_value("LicenseUrl")
+                  copyright_status = metadata_value("Copyrighted").lower()
+                  license_lower = license_name.lower()
+
+                  reusable = (
+                      "cc by" in license_lower
+                      or "cc0" in license_lower
+                      or "public domain" in license_lower
+                      or "public domain" in copyright_status
+                      or copyright_status == "false"
+                  )
+
+                  if not reusable:
+                      continue
+
+                  image_url = info.get("thumburl") or info.get("url", "")
+                  if not image_url.startswith("https://"):
+                      continue
+
+                  results.append({
+                      "url": image_url,
+                      "title": title,
+                      "creator": metadata_value("Artist"),
+                      "license": license_name,
+                      "license_url": license_url,
+                      "foreign_landing_url": info.get("descriptionurl", ""),
+                      "attribution": metadata_value("Attribution")
+                          or metadata_value("Credit")
+                          or metadata_value("Artist")
+                  })
+
+              if len(results) >= 15:
+                  break
+
+          attribution = []
+
+          for item in results:
+              if len(attribution) >= 5:
+                  break
+
+              try:
+                  request = urllib.request.Request(
+                      item["url"],
+                      headers={"User-Agent": "AIYouTubeFactory/1.0"}
+                  )
+
+                  with urllib.request.urlopen(request, timeout=30) as response:
+                      content_type = response.headers.get(
+                          "Content-Type", ""
+                      ).split(";")[0].lower()
+                      raw = response.read(8 * 1024 * 1024 + 1)
+
+                  if content_type not in (
+                      "image/jpeg",
+                      "image/png",
+                      "image/webp"
+                  ):
+                      continue
+
+                  if len(raw) > 8 * 1024 * 1024:
+                      continue
+
+                  im = Image.open(io.BytesIO(raw))
+                  im.load()
+
+                  if im.width < 800 or im.height < 450:
+                      continue
+
+                  filename = f"image-{len(attribution) + 1}.jpg"
+                  im.convert("RGB").save(images / filename, quality=90)
+                  item["file"] = filename
+                  attribution.append(item)
+                  print("Downloaded image:", filename, "-", item.get("title", ""))
+
+              except Exception as error:
+                  print("Skipping image:", str(error))
+
+          if not attribution:
+              raise SystemExit("No suitable images found from Wikimedia Commons.")
+
+          (out / "attribution.json").write_text(
+              json.dumps(attribution, indent=2, ensure_ascii=False),
+              encoding="utf-8"
+          )
+
+          duration = float(subprocess.check_output([
+              "ffprobe", "-v", "error",
+              "-show_entries", "format=duration",
+              "-of", "default=noprint_wrappers=1:nokey=1",
+              str(out / "narration.wav")
+          ], text=True).strip())
+
+          words = script.split()
+
+          def stamp(seconds):
+              milliseconds = int(seconds * 1000)
+              hours, milliseconds = divmod(milliseconds, 3600000)
+              minutes, milliseconds = divmod(milliseconds, 60000)
+              seconds, milliseconds = divmod(milliseconds, 1000)
+              return f"{hours:02}:{minutes:02}:{seconds:02},{milliseconds:03}"
+
+          groups = [words[i:i + 8] for i in range(0, len(words), 8)]
+
+          with open(out / "captions.srt", "w", encoding="utf-8") as file:
+              for index, group in enumerate(groups):
+                  start = duration * index / len(groups)
+                  end = duration * (index + 1) / len(groups)
+                  file.write(
+                      f"{index + 1}\n{stamp(start)} --> {stamp(end)}\n"
+                      + " ".join(group) + "\n\n"
+                  )
+
+          (out / "duration.txt").write_text(str(duration), encoding="utf-8")
+          print(f"Prepared script, narration and {len(attribution)} images.")
+          PY
+
+          python build.py
+
+      - name: Generate original procedural background music
+        run: |
+          set -euo pipefail
+
+          python - <<'PY'
+          import math
+          import random
+          import wave
+          import struct
+          from pathlib import Path
+
+          duration = float(Path("output/duration.txt").read_text().strip()) + 4
+          sample_rate = 22050
+          rng = random.SystemRandom()
+          seed = rng.randrange(1, 2**31)
           random.seed(seed)
 
           root_notes = random.choice([55.0, 61.74, 65.41, 73.42, 82.41])
@@ -123,3 +443,4 @@
           path: output/
           if-no-files-found: error
           retention-days: 7
+          
