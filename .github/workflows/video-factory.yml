@@ -1,22 +1,15 @@
-
 name: AI YouTube Factory - Build Video
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "0 16 * * *"
 
 permissions:
   contents: read
 
-concurrency:
-  group: ai-youtube-factory
-  cancel-in-progress: false
-
 jobs:
   build-video:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 20
 
     steps:
       - name: Check out repository
@@ -25,700 +18,836 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg fonts-dejavu-core
-          python -m pip install --upgrade pip
-          python -m pip install requests pillow google-api-python-client google-auth google-auth-httplib2
+          sudo apt-get install -y ffmpeg
+          python -m pip install --quiet requests pillow
 
-      - name: Generate and upload video
+      - name: Generate script, narration and images
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          set -euo pipefail
+
+          cat > build.py <<'PY'
+          import os
+          import json
+          import base64
+          import wave
+          import requests
+          import subprocess
+          import urllib.request
+          import io
+          import re
+          import html
+          import random
+          from pathlib import Path
+          from PIL import Image
+
+          key = os.environ["GEMINI_API_KEY"]
+          out = Path("output")
+          images = out / "images"
+          images.mkdir(parents=True, exist_ok=True)
+
+          topics = [
+              "the Mary Celeste and the evidence behind its abandonment",
+              "the disappearance of the Roanoke colony and competing explanations",
+              "the Voynich manuscript and what researchers can actually establish",
+              "the Antikythera mechanism and what it reveals about ancient technology",
+              "the lost Franklin expedition and the evidence recovered afterward",
+              "the Nazca Lines and the leading explanations for their purpose",
+              "the disappearance of the Princes in the Tower and the limits of the evidence",
+              "the eruption of Vesuvius and the clues preserved at Pompeii",
+              "the mystery of the Phaistos Disc and why its writing remains undeciphered",
+              "the real history and evidence surrounding the Green Children of Woolpit",
+              "the fate of the Donner Party, focusing on documented decisions and evidence",
+              "the collapse of the Bronze Age societies and the evidence for multiple causes"
+          ]
+          topic = random.choice(topics)
+          (out / "topic.txt").write_text(topic, encoding="utf-8")
+
+          prompt = f"""Write an original, engaging long-form YouTube documentary narration about:
+          {topic}
+
+          Target roughly 1,000–1,300 spoken words, with a strong opening mystery or surprising
+          documented fact in the first two sentences. Do not begin with greetings, channel
+          introductions, or generic phrases such as 'throughout history'.
+
+          Structure the narration as a story:
+          - Open with a specific question, scene, or contradiction that creates curiosity.
+          - Establish the real people, place, and historical context clearly.
+          - Reveal evidence in a logical sequence, adding meaningful new information as the
+            story progresses.
+          - Explain the strongest competing interpretations fairly and distinguish confirmed
+            facts from disputed claims and speculation.
+          - Include a few natural curiosity gaps, but resolve them honestly rather than
+            withholding basic information or making misleading promises.
+          - End with a satisfying conclusion explaining what is known, what remains uncertain,
+            and why the mystery matters.
+
+          Quality rules:
+          - Be fact-conscious. Never invent quotations, scenes, dates, sources, or evidence.
+          - Do not present myths or internet rumours as established facts.
+          - Avoid repetitive wording, filler, exaggerated clickbait, and repeated summaries.
+          - Make this narration distinctive, specific to this topic, and suitable for spoken
+            delivery in clear, natural British English.
+          - Return only the spoken narration. Do not include a title, headings, bullet points,
+            citations, stage directions, or notes to the editor."""
+
+          response = requests.post(
+              "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent",
+              headers={"x-goog-api-key": key},
+              json={
+                  "contents": [{"parts": [{"text": prompt}]}],
+                  "generationConfig": {
+                      "temperature": 0.7,
+                      "maxOutputTokens": 2400
+                  }
+              },
+              timeout=90
+          )
+          response.raise_for_status()
+          data = response.json()
+          script = "".join(
+              part.get("text", "")
+              for part in data["candidates"][0]["content"]["parts"]
+          ).strip()
+
+          if not script:
+              raise SystemExit("Script generation returned empty text.")
+
+          (out / "script.txt").write_text(script, encoding="utf-8")
+          print("Script generated.")
+
+          payload = {
+              "contents": [{"parts": [{"text": script}]}],
+              "generationConfig": {
+                  "responseModalities": ["AUDIO"],
+                  "speechConfig": {
+                      "voiceConfig": {
+                          "prebuiltVoiceConfig": {
+                              "voiceName": "Kore"
+                          }
+                      }
+                  }
+              }
+          }
+
+          response = requests.post(
+              "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-tts:generateContent",
+              headers={
+                  "x-goog-api-key": key,
+                  "Content-Type": "application/json"
+              },
+              json=payload,
+              timeout=180
+          )
+
+          if not response.ok:
+              print(response.text[:2000])
+              response.raise_for_status()
+
+          audio = None
+          mime_type = ""
+          for part in response.json().get("candidates", [{}])[0].get("content", {}).get("parts", []):
+              inline_data = part.get("inlineData") or part.get("inline_data") or {}
+              if inline_data.get("data"):
+                  audio = inline_data["data"]
+                  mime_type = inline_data.get("mimeType") or inline_data.get("mime_type") or ""
+                  break
+
+          if not audio:
+              raise SystemExit("No narration audio returned by Gemini TTS.")
+
+          audio_bytes = base64.b64decode(audio)
+          if audio_bytes.startswith(b"RIFF"):
+              (out / "narration.wav").write_bytes(audio_bytes)
+          else:
+              sample_rate_match = re.search(r"rate=(\\d+)", mime_type)
+              sample_rate = int(sample_rate_match.group(1)) if sample_rate_match else 24000
+              with wave.open(str(out / "narration.wav"), "wb") as wav_file:
+                  wav_file.setnchannels(1)
+                  wav_file.setsampwidth(2)
+                  wav_file.setframerate(sample_rate)
+                  wav_file.writeframes(audio_bytes)
+
+          print("Narration generated.")
+
+
+          visual_prompt = f"""You are preparing visual references for a factual historical documentary.
+          The narration is divided into numbered passages below. Return ONLY valid JSON:
+          {{"scenes":[{{"index":1,"title":"short visual label","query":"specific Wikimedia Commons search phrase"}}]}}
+          Create exactly one scene for every passage, preserving the passage order.
+          Queries must be grounded in names, locations, historical sites, documents, artefacts,
+          architecture, landscapes, or other clearly documented non-weapon subjects mentioned
+          in that passage. Prefer precise named entities over generic mood words. Never invent
+          an object or event. Do not search for weapons or ordnance; if a passage mentions them,
+          choose the surrounding location, people, records, or historical context instead.
+          Keep each query to 3–7 useful words. Avoid generic searches like "history", "mystery",
+          "dark", "old building", or "historical photo".
+
+          PASSAGES:
+          """
+          script_words = script.split()
+          scene_count = 12
+          chunk_size = max(1, (len(script_words) + scene_count - 1) // scene_count)
+          passages = []
+          for index in range(scene_count):
+              passage_words = script_words[index * chunk_size:(index + 1) * chunk_size]
+              if passage_words:
+                  passages.append({
+                      "index": index + 1,
+                      "text": " ".join(passage_words)
+                  })
+
+          visual_input = visual_prompt + json.dumps(passages, ensure_ascii=False)
+          visual_response = requests.post(
+              "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent",
+              headers={"x-goog-api-key": key},
+              json={
+                  "contents": [{"parts": [{"text": visual_input}]}],
+                  "generationConfig": {
+                      "temperature": 0.2,
+                      "maxOutputTokens": 1800,
+                      "responseMimeType": "application/json"
+                  }
+              },
+              timeout=90
+          )
+          visual_response.raise_for_status()
+          visual_data = visual_response.json()
+          visual_text = "".join(
+              part.get("text", "")
+              for part in visual_data["candidates"][0]["content"]["parts"]
+          ).strip()
+          visual_text = re.sub(r"^```(?:json)?\s*|\s*```$", "", visual_text)
+          try:
+              visual_scenes = json.loads(visual_text).get("scenes", [])
+          except json.JSONDecodeError:
+              visual_scenes = []
+
+          scene_by_index = {
+              int(item.get("index", 0)): item
+              for item in visual_scenes
+              if str(item.get("index", "")).isdigit()
+          }
+
+          def clean_text(value):
+              value = re.sub(r"<[^>]*>", "", str(value or ""))
+              return html.unescape(value).strip()
+
+          def tokens(value):
+              ignored = {
+                  "the", "and", "for", "with", "from", "that", "this", "into",
+                  "near", "about", "during", "after", "before", "image", "photo",
+                  "historic", "historical", "documentary", "scene", "view"
+              }
+              return {
+                  word for word in re.findall(r"[a-z0-9]+", value.lower())
+                  if len(word) > 2 and word not in ignored
+              }
+
+          def make_context_card(path, title, passage):
+              from PIL import ImageDraw, ImageFont
+              canvas = Image.new("RGB", (1920, 1080), (13, 16, 22))
+              draw = ImageDraw.Draw(canvas)
+              for y in range(0, 1080, 4):
+                  shade = int(18 + 16 * y / 1080)
+                  draw.line((0, y, 1920, y), fill=(shade, shade + 2, shade + 8), width=4)
+              draw.rectangle((120, 130, 1800, 950), outline=(85, 105, 128), width=3)
+              try:
+                  heading_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 66)
+                  body_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 30)
+              except OSError:
+                  heading_font = ImageFont.load_default()
+                  body_font = ImageFont.load_default()
+              draw.text((180, 205), "HISTORICAL CONTEXT", font=body_font, fill=(155, 177, 201))
+              title_lines = []
+              current = ""
+              for word in (title or "Documentary context").split():
+                  candidate = (current + " " + word).strip()
+                  if len(candidate) > 30:
+                      title_lines.append(current)
+                      current = word
+                  else:
+                      current = candidate
+              if current:
+                  title_lines.append(current)
+              y = 330
+              for line in title_lines[:4]:
+                  draw.text((180, y), line, font=heading_font, fill=(240, 243, 248))
+                  y += 88
+              excerpt = " ".join(passage.split()[:26])
+              if len(excerpt) > 180:
+                  excerpt = excerpt[:177].rsplit(" ", 1)[0] + "..."
+              draw.text((180, 790), excerpt, font=body_font, fill=(174, 185, 199))
+              canvas.save(path, quality=92)
+
+          def image_candidates(search_query):
+              params = {
+                  "action": "query",
+                  "generator": "search",
+                  "gsrsearch": search_query,
+                  "gsrnamespace": 6,
+                  "gsrlimit": 18,
+                  "prop": "imageinfo",
+                  "iiprop": "url|extmetadata",
+                  "iiurlwidth": 1920,
+                  "format": "json"
+              }
+              response = requests.get(
+                  "https://commons.wikimedia.org/w/api.php",
+                  params=params,
+                  headers={"User-Agent": "AIYouTubeFactory/1.0 (documentary production)"},
+                  timeout=45
+              )
+              response.raise_for_status()
+              pages = response.json().get("query", {}).get("pages", {}).values()
+              query_tokens = tokens(search_query)
+              ranked = []
+              for page in pages:
+                  title = page.get("title", "")
+                  info_list = page.get("imageinfo", [])
+                  if not info_list:
+                      continue
+                  info = info_list[0]
+                  metadata = info.get("extmetadata", {})
+                  description = clean_text(metadata.get("ImageDescription", {}).get("value", ""))
+                  categories = clean_text(metadata.get("Categories", {}).get("value", ""))
+                  searchable = title + " " + description + " " + categories
+                  match_tokens = tokens(searchable)
+                  overlap = len(query_tokens & match_tokens)
+                  score = overlap / max(1, len(query_tokens))
+                  if overlap < 2 or score < 0.28:
+                      continue
+                  license_name = clean_text(metadata.get("LicenseShortName", {}).get("value", ""))
+                  copyright_status = clean_text(metadata.get("Copyrighted", {}).get("value", "")).lower()
+                  license_lower = license_name.lower()
+                  reusable = (
+                      "cc by" in license_lower
+                      or "cc0" in license_lower
+                      or "public domain" in license_lower
+                      or "public domain" in copyright_status
+                      or copyright_status == "false"
+                  )
+                  if not reusable:
+                      continue
+                  image_url = info.get("thumburl") or info.get("url", "")
+                  if not image_url.startswith("https://"):
+                      continue
+                  ranked.append((score, {
+                      "url": image_url,
+                      "title": title,
+                      "creator": clean_text(metadata.get("Artist", {}).get("value", "")),
+                      "license": license_name,
+                      "license_url": clean_text(metadata.get("LicenseUrl", {}).get("value", "")),
+                      "foreign_landing_url": info.get("descriptionurl", ""),
+                      "attribution": clean_text(
+                          metadata.get("Attribution", {}).get("value", "")
+                          or metadata.get("Credit", {}).get("value", "")
+                          or metadata.get("Artist", {}).get("value", "")
+                      ),
+                      "match_score": round(score, 3)
+                  }))
+              ranked.sort(key=lambda pair: pair[0], reverse=True)
+              return [item for _, item in ranked]
+
+          attribution = []
+          scene_manifest = []
+          used_titles = set()
+
+          for scene_index, passage in enumerate(passages, start=1):
+              planned = scene_by_index.get(scene_index, {})
+              scene_title = clean_text(planned.get("title", "")) or f"Documentary scene {scene_index}"
+              search_query = clean_text(planned.get("query", ""))
+              if len(tokens(search_query)) < 2:
+                  search_query = scene_title
+              print(f"Scene {scene_index:02d} image search: {search_query}")
+              selected = None
+              try:
+                  for candidate in image_candidates(search_query):
+                      if candidate["title"] in used_titles:
+                          continue
+                      try:
+                          request = urllib.request.Request(
+                              candidate["url"],
+                              headers={"User-Agent": "AIYouTubeFactory/1.0"}
+                          )
+                          with urllib.request.urlopen(request, timeout=30) as image_response:
+                              content_type = image_response.headers.get(
+                                  "Content-Type", ""
+                              ).split(";")[0].lower()
+                              raw = image_response.read(8 * 1024 * 1024 + 1)
+                          if content_type not in ("image/jpeg", "image/png", "image/webp"):
+                              continue
+                          if len(raw) > 8 * 1024 * 1024:
+                              continue
+                          image = Image.open(io.BytesIO(raw))
+                          image.load()
+                          if image.width < 800 or image.height < 450:
+                              continue
+                          filename = f"image-{scene_index}.jpg"
+                          image.convert("RGB").save(images / filename, quality=91)
+                          candidate["file"] = filename
+                          candidate["scene"] = scene_index
+                          candidate["search_query"] = search_query
+                          selected = candidate
+                          used_titles.add(candidate["title"])
+                          print(
+                              f"Matched scene {scene_index:02d}: "
+                              f"{candidate['title']} (score {candidate['match_score']})"
+                          )
+                          break
+                      except Exception as error:
+                          print("Skipping candidate:", str(error))
+              except Exception as error:
+                  print(f"Image search failed for scene {scene_index}: {error}")
+
+              if selected:
+                  attribution.append(selected)
+                  visual_kind = "commons"
+              else:
+                  filename = f"image-{scene_index}.jpg"
+                  make_context_card(images / filename, scene_title, passage["text"])
+                  attribution.append({
+                      "file": filename,
+                      "title": scene_title + " — generated context card",
+                      "creator": "AI YouTube Factory",
+                      "attribution": "Generated contextual graphic; no external image used",
+                      "license": "Generated graphic",
+                      "license_url": "",
+                      "foreign_landing_url": "",
+                      "scene": scene_index,
+                      "search_query": search_query,
+                      "match_score": 0
+                  })
+                  visual_kind = "context_card"
+                  print(f"Scene {scene_index:02d}: no sufficiently relevant licensed image; using context card.")
+
+              scene_manifest.append({
+                  "index": scene_index,
+                  "title": scene_title,
+                  "query": search_query,
+                  "word_count": len(passage["text"].split()),
+                  "file": filename,
+                  "visual_kind": visual_kind
+              })
+
+          (out / "attribution.json").write_text(
+              json.dumps(attribution, indent=2, ensure_ascii=False),
+              encoding="utf-8"
+          )
+          (out / "scenes.json").write_text(
+              json.dumps(scene_manifest, indent=2, ensure_ascii=False),
+              encoding="utf-8"
+          )
+          duration = float(subprocess.check_output([
+              "ffprobe", "-v", "error",
+              "-show_entries", "format=duration",
+              "-of", "default=noprint_wrappers=1:nokey=1",
+              str(out / "narration.wav")
+          ], text=True).strip())
+
+          words = script.split()
+
+          def stamp(seconds):
+              milliseconds = int(seconds * 1000)
+              hours, milliseconds = divmod(milliseconds, 3600000)
+              minutes, milliseconds = divmod(milliseconds, 60000)
+              seconds, milliseconds = divmod(milliseconds, 1000)
+              return f"{hours:02}:{minutes:02}:{seconds:02},{milliseconds:03}"
+
+          groups = [words[i:i + 8] for i in range(0, len(words), 8)]
+
+          with open(out / "captions.srt", "w", encoding="utf-8") as file:
+              for index, group in enumerate(groups):
+                  start = duration * index / len(groups)
+                  end = duration * (index + 1) / len(groups)
+                  file.write(
+                      f"{index + 1}\n{stamp(start)} --> {stamp(end)}\n"
+                      + " ".join(group) + "\n\n"
+                  )
+
+          scene_total = sum(max(1, item.get("word_count", 1)) for item in scene_manifest)
+          scene_timings = []
+          cursor = 0.0
+          for item in scene_manifest:
+              segment_duration = duration * max(1, item.get("word_count", 1)) / scene_total
+              scene_timings.append({
+                  **item,
+                  "start": cursor,
+                  "duration": segment_duration
+              })
+              cursor += segment_duration
+
+          (out / "scene-timings.json").write_text(
+              json.dumps(scene_timings, indent=2, ensure_ascii=False),
+              encoding="utf-8"
+          )
+          (out / "duration.txt").write_text(str(duration), encoding="utf-8")
+          print(f"Prepared script, narration and {len(attribution)} scene-matched visuals.")
+          PY
+
+          python build.py
+
+      - name: Validate generated script, narration and images
+        run: |
+          set -euo pipefail
+
+          python - <<'PY'
+          import json
+          import subprocess
+          from pathlib import Path
+
+          out = Path("output")
+          script_path = out / "script.txt"
+          narration_path = out / "narration.wav"
+          attribution_path = out / "attribution.json"
+          images_dir = out / "images"
+
+          for path in (script_path, narration_path, attribution_path):
+              if not path.is_file() or path.stat().st_size == 0:
+                  raise SystemExit(f"Quality check failed: {path} is missing or empty.")
+
+          script = script_path.read_text(encoding="utf-8").strip()
+          words = script.split()
+          if len(words) < 500:
+              raise SystemExit(
+                  f"Quality check failed: narration has only {len(words)} words; "
+                  "at least 500 are required for this long-form workflow."
+              )
+
+          if len(words) > 1800:
+              raise SystemExit(
+                  f"Quality check failed: narration has {len(words)} words; "
+                  "maximum allowed is 1800 for this workflow."
+              )
+
+          audio_probe = subprocess.run(
+              [
+                  "ffprobe", "-v", "error",
+                  "-show_entries", "format=duration",
+                  "-of", "default=noprint_wrappers=1:nokey=1",
+                  str(narration_path)
+              ],
+              capture_output=True, text=True, check=True
+          )
+          duration = float(audio_probe.stdout.strip())
+          if duration < 60:
+              raise SystemExit(
+                  f"Quality check failed: narration audio is only {duration:.1f} seconds."
+              )
+
+          attribution = json.loads(attribution_path.read_text(encoding="utf-8"))
+          images = sorted(images_dir.glob("image-*.jpg"))
+
+          if len(images) < 3:
+              raise SystemExit(
+                  f"Quality check failed: only {len(images)} suitable images were downloaded."
+              )
+
+          for image in images:
+              if image.stat().st_size < 10000:
+                  raise SystemExit(f"Quality check failed: {image.name} is unexpectedly small.")
+
+          attribution_files = {item.get("file") for item in attribution}
+          for image in images:
+              if image.name not in attribution_files:
+                  raise SystemExit(
+                      f"Quality check failed: {image.name} has no matching attribution record."
+                  )
+
+          print(f"Script: {len(words)} words")
+          print(f"Narration: {duration:.1f} seconds")
+          print(f"Images: {len(images)}")
+          print("Pre-production quality checks passed.")
+          PY
+
+      - name: Generate original procedural background music
+        run: |
+          set -euo pipefail
+
+          python - <<'PY'
+          import math
+          import random
+          import wave
+          import struct
+          from pathlib import Path
+
+          duration = float(Path("output/duration.txt").read_text().strip()) + 4
+          sample_rate = 22050
+          rng = random.SystemRandom()
+          seed = rng.randrange(1, 2**31)
+          random.seed(seed)
+
+          root_notes = random.choice([55.0, 61.74, 65.41, 73.42, 82.41])
+          chord_sets = [
+              [1.0, 1.1892, 1.4983],
+              [1.0, 1.1892, 1.4142],
+              [1.0, 1.2599, 1.4983],
+              [1.0, 1.1225, 1.3348]
+          ]
+          chords = [random.choice(chord_sets) for _ in range(4)]
+          chord_length = max(8.0, duration / 4)
+          total_samples = int(duration * sample_rate)
+          pulse_rate = random.choice([0.04, 0.06, 0.08])
+          output = Path("output/background-music.wav")
+
+          with wave.open(str(output), "wb") as wav:
+              wav.setnchannels(2)
+              wav.setsampwidth(2)
+              wav.setframerate(sample_rate)
+
+              buffer = bytearray()
+
+              for start in range(0, total_samples, 4096):
+                  end = min(start + 4096, total_samples)
+
+                  for n in range(start, end):
+                      t = n / sample_rate
+                      chord_index = min(3, int(t / chord_length))
+                      chord = chords[chord_index]
+                      fade_in = min(1.0, t / 2.5)
+                      fade_out = min(1.0, max(0.0, (duration - t) / 3.5))
+                      envelope = fade_in * fade_out
+
+                      left = 0.0
+                      right = 0.0
+
+                      for i, ratio in enumerate(chord):
+                          frequency = root_notes * ratio
+                          slow_motion = 1.0 + 0.003 * math.sin(
+                              2 * math.pi * (0.025 + i * 0.009) * t
+                          )
+                          phase = 2 * math.pi * frequency * slow_motion * t
+                          tone = (
+                              math.sin(phase)
+                              + 0.28 * math.sin(phase * 2.003)
+                          ) / 1.28
+                          left += tone * (0.16 / (i + 1))
+                          right += math.sin(phase + 0.12 * i) * (0.16 / (i + 1))
+
+                      drone = (
+                          math.sin(2 * math.pi * (root_notes / 2) * t) * 0.12
+                          + math.sin(2 * math.pi * (root_notes / 2.01) * t) * 0.08
+                      )
+
+                      pulse = max(
+                          0.0,
+                          math.sin(2 * math.pi * pulse_rate * t)
+                      ) ** 8 * 0.035
+
+                      left = (left * 0.55 + drone + pulse) * envelope
+                      right = (right * 0.55 + drone + pulse) * envelope
+
+                      left = max(-0.8, min(0.8, left))
+                      right = max(-0.8, min(0.8, right))
+
+                      buffer.extend(struct.pack(
+                          "<hh",
+                          int(left * 32767),
+                          int(right * 32767)
+                      ))
+
+                  wav.writeframesraw(buffer)
+                  buffer.clear()
+
+          print(f"Generated a new ambient music track using seed {seed}.")
+          print(f"Music duration: {duration:.1f} seconds.")
+          PY
+
+      - name: Assemble MP4 with cinematic motion and crossfades
+        run: |
+          set -euo pipefail
+
+          python - <<'PY'
+          import json
+          import subprocess
+          from pathlib import Path
+
+          out = Path("output")
+          scenes = json.loads((out / "scene-timings.json").read_text(encoding="utf-8"))
+          duration = float((out / "duration.txt").read_text().strip())
+          transition = 0.65
+          command = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y"]
+
+          for index, scene in enumerate(scenes):
+              clip_duration = float(scene["duration"])
+              if index > 0:
+                  clip_duration += transition
+              command.extend([
+                  "-loop", "1",
+                  "-framerate", "24",
+                  "-t", f"{clip_duration:.4f}",
+                  "-i", str(out / "images" / scene["file"])
+              ])
+
+          narration_index = len(scenes)
+          music_index = len(scenes) + 1
+          command.extend(["-i", str(out / "narration.wav"), "-i", str(out / "background-music.wav")])
+
+          filters = []
+          for index, scene in enumerate(scenes):
+              clip_duration = float(scene["duration"]) + (transition if index > 0 else 0)
+              filters.append(
+                  f"[{index}:v]"
+                  "scale=2000:1125:force_original_aspect_ratio=increase,"
+                  "crop=2000:1125,"
+                  "zoompan=z='min(zoom+0.00065,1.10)':"
+                  "x='(iw-iw/zoom)/2+sin(on/95)*18':"
+                  "y='(ih-ih/zoom)/2+cos(on/115)*12':"
+                  "d=1:s=1920x1080:fps=24,"
+                  "setsar=1,format=yuv420p,settb=AVTB,setpts=PTS-STARTPTS,"
+                  f"trim=duration={clip_duration:.4f}[v{index}]"
+              )
+
+          if len(scenes) == 1:
+              current_video = "v0"
+          else:
+              current_video = "v0"
+              cumulative = float(scenes[0]["duration"])
+              for index in range(1, len(scenes)):
+                  next_label = f"xf{index}"
+                  offset = max(0.0, cumulative - transition)
+                  filters.append(
+                      f"[{current_video}][v{index}]"
+                      f"xfade=transition=fade:duration={transition:.3f}:offset={offset:.4f}"
+                      f"[{next_label}]"
+                  )
+                  current_video = next_label
+                  cumulative += float(scenes[index]["duration"])
+
+          fade_start = max(0.0, duration - 3.0)
+          filters.append(
+              f"[{current_video}]"
+              "subtitles=output/captions.srt:"
+              "force_style='FontName=Arial,FontSize=22,Outline=2,Shadow=1,Alignment=2,MarginV=55'"
+              "[video]"
+          )
+          filters.append(f"[{narration_index}:a]volume=1.0[narration]")
+          filters.append(
+              f"[{music_index}:a]volume=0.085,"
+              f"afade=t=out:st={fade_start:.3f}:d=3[music]"
+          )
+          filters.append("[narration][music]amix=inputs=2:duration=first:dropout_transition=2[audio]")
+
+          command.extend([
+              "-filter_complex", ";".join(filters),
+              "-map", "[video]",
+              "-map", "[audio]",
+              "-c:v", "libx264",
+              "-preset", "ultrafast",
+              "-crf", "22",
+              "-r", "24",
+              "-c:a", "aac",
+              "-b:a", "160k",
+              "-t", f"{duration:.3f}",
+              "-movflags", "+faststart",
+              str(out / "mystery-documentary.mp4")
+          ])
+
+          print(f"Rendering {len(scenes)} narration-matched scenes with slow pan/zoom and crossfades.")
+          subprocess.run(command, check=True)
+          print("Cinematic edit completed.")
+          PY
+
+      - name: Validate final video
+        run: |
+          set -euo pipefail
+
+          video="output/mystery-documentary.mp4"
+
+          if [ ! -s "$video" ]; then
+            echo "Quality check failed: final MP4 is missing or empty."
+            exit 1
+          fi
+
+          duration=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$video")
+          size=$(stat -c%s "$video")
+
+          python - "$duration" "$size" <<'PY'
+          import sys
+
+          duration = float(sys.argv[1])
+          size = int(sys.argv[2])
+
+          if duration < 60:
+              raise SystemExit(f"Final video is too short: {duration:.1f} seconds.")
+          if size < 500000:
+              raise SystemExit(f"Final video file is unexpectedly small: {size} bytes.")
+
+          print(f"Final MP4 verified: {duration:.1f} seconds, {size:,} bytes.")
+          PY
+
+          ffmpeg -v error -i "$video" -f null -
+
+      - name: Upload video to YouTube as private
+        env:
           YOUTUBE_CLIENT_ID: ${{ secrets.YOUTUBE_CLIENT_ID }}
           YOUTUBE_CLIENT_SECRET: ${{ secrets.YOUTUBE_CLIENT_SECRET }}
           YOUTUBE_REFRESH_TOKEN: ${{ secrets.YOUTUBE_REFRESH_TOKEN }}
         run: |
           set -euo pipefail
-          mkdir -p output/images output/scenes
+          python -m pip install --quiet google-api-python-client google-auth google-auth-httplib2
 
-          cat > build.py <<'PYTHON'
-          import os
-          import re
-          import io
+          python - <<'PY'
           import json
-          import time
-          import wave
-          import base64
-          import subprocess
+          import os
           from pathlib import Path
-
-          import requests
-          from requests.adapters import HTTPAdapter
-          from urllib3.util.retry import Retry
-          from PIL import Image, ImageDraw, ImageFont, ImageOps
-
           from google.oauth2.credentials import Credentials
           from googleapiclient.discovery import build
           from googleapiclient.http import MediaFileUpload
 
-          ROOT = Path("output")
-          IMAGES = ROOT / "images"
-          SCENES = ROOT / "scenes"
-          ROOT.mkdir(exist_ok=True)
-          IMAGES.mkdir(exist_ok=True)
-          SCENES.mkdir(exist_ok=True)
-
-          API_KEY = os.environ["GEMINI_API_KEY"]
-          MODEL = "gemini-3.5-flash-lite"
-          TTS_MODEL = "gemini-2.5-flash-preview-tts"
-          SHOT_COUNT = 24
-
-          session = requests.Session()
-          retry = Retry(
-              total=3,
-              connect=3,
-              read=3,
-              backoff_factor=2,
-              status_forcelist=[429, 500, 502, 503, 504],
-              allowed_methods=["GET", "POST"],
-              respect_retry_after_header=True
-          )
-          session.mount("https://", HTTPAdapter(max_retries=retry))
-          session.headers.update({"User-Agent": "AIYouTubeFactory/2.0"})
-
-          def save_text(name, value):
-              (ROOT / name).write_text(value, encoding="utf-8")
-
-          def gemini_generate(prompt):
-              url = (
-                  "https://generativelanguage.googleapis.com/v1beta/models/"
-                  + MODEL + ":generateContent"
-              )
-              response = session.post(
-                  url,
-                  params={"key": API_KEY},
-                  json={
-                      "contents": [{"parts": [{"text": prompt}]}],
-                      "generationConfig": {
-                          "temperature": 0.65,
-                          "responseMimeType": "application/json"
-                      }
-                  },
-                  timeout=180
-              )
-              response.raise_for_status()
-              data = response.json()
-              text = data["candidates"][0]["content"]["parts"][0]["text"]
-              text = re.sub(r"^```(?:json)?\s*", "", text.strip())
-              text = re.sub(r"\s*```$", "", text)
-              return json.loads(text)
-
-          prompt = """
-          Create a compelling real-world investigation documentary for
-          the YouTube channel The Midnight Archive.
-
-          Cover one real, documented historical event, mystery,
-          disappearance, disaster, military incident, or unusual discovery.
-          Choose a subject with sufficient historical information and
-          identifiable people, places, objects, vehicles, or events.
-
-          This must be about real events. Do not invent investigators,
-          fictional characters, conversations, evidence, quotations,
-          eyewitness accounts, or historical documents.
-
-          Distinguish established facts from theories. Be honest about
-          uncertainty. Do not invent sources or pretend speculation is fact.
-
-          Return valid JSON only:
-          {
-            "title": "Accurate documentary title",
-            "description": "Documentary description",
-            "sources": [
-              {"name": "Source name", "url": "Full URL"}
-            ],
-            "shots": [
-              {
-                "narration": "A consecutive passage of narration",
-                "visual_search": "Specific subject to show",
-                "visual_description": "Concrete visual composition"
-              }
-            ]
-          }
-
-          Requirements:
-          - Exactly 24 shots.
-          - Approximately 900 to 1100 words in total.
-          - Each shot should usually contain 30 to 55 words.
-          - Each shot must advance the same investigation.
-          - Keep narration in chronological order.
-          - Each passage must be consecutive and must not repeat another.
-          - Match every image to the specific narration passage.
-          - Change the image when the subject changes.
-          - If discussing a warship, show the relevant ship.
-          - If the narration then discusses a torpedo, show the torpedo
-            or a relevant torpedo-related scene instead.
-          - Identify named real ships, aircraft, weapons, people, places,
-            and objects in visual_search wherever possible.
-          - Avoid generic offices, fictional investigators, and unrelated
-            stock-style scenes.
-          - Use accurate historical settings, objects, and technology.
-          - If a real photograph is unavailable, describe a clearly
-            illustrative historical reconstruction.
-          - Do not claim generated images are authentic photographs.
-          - Include only source URLs you believe are genuine and relevant.
-          - Prefer official archives, museums, government records,
-            reputable publications, and established reference works.
-          - Use natural spoken English, with a compelling opening,
-            evidence, competing explanations, and a thoughtful conclusion.
-          - No filler, invented quotations, misleading clickbait,
-            sound cues, or production instructions in narration.
-          - Do not imitate a living artist.
-          """
-
-          print("Generating documentary script...")
-          story = gemini_generate(prompt)
-          shots = story.get("shots", [])
-
-          if len(shots) != SHOT_COUNT:
-              raise RuntimeError(
-                  f"Expected {SHOT_COUNT} shots, received {len(shots)}."
+          required = [
+              "YOUTUBE_CLIENT_ID",
+              "YOUTUBE_CLIENT_SECRET",
+              "YOUTUBE_REFRESH_TOKEN",
+          ]
+          missing = [name for name in required if not os.environ.get(name)]
+          if missing:
+              raise SystemExit(
+                  "Missing GitHub repository secrets: " + ", ".join(missing)
               )
 
-          if not story.get("title") or not story.get("description"):
-              raise RuntimeError("Missing title or description.")
-
-          for shot in shots:
-              for field in ("narration", "visual_search", "visual_description"):
-                  if not isinstance(shot.get(field), str) or not shot[field].strip():
-                      raise RuntimeError("A shot is missing " + field)
-
-          narration = "\n\n".join(
-              shot["narration"].strip() for shot in shots
-          )
-          title = story["title"].strip()
-          description = story["description"].strip()
-          total_words = sum(
-              len(shot["narration"].split()) for shot in shots
+          out = Path("output")
+          topic = (out / "topic.txt").read_text(encoding="utf-8").strip()
+          video_path = out / "mystery-documentary.mp4"
+          attributions = json.loads(
+              (out / "attribution.json").read_text(encoding="utf-8")
           )
 
-          save_text("title.txt", title)
-          save_text("description.txt", description)
-          save_text("script.txt", narration)
-          save_text("scenes.json", json.dumps(story, ensure_ascii=False, indent=2))
-
-          def generate_audio(text):
-              url = (
-                  "https://generativelanguage.googleapis.com/v1beta/models/"
-                  + TTS_MODEL + ":generateContent"
-              )
-              response = session.post(
-                  url,
-                  params={"key": API_KEY},
-                  json={
-                      "contents": [{
-                          "parts": [{
-                              "text": (
-                                  "Read this documentary narration naturally "
-                                  "in a clear, measured British documentary "
-                                  "style. Do not add words. Narration: " + text
-                              )
-                          }]
-                      }],
-                      "generationConfig": {
-                          "responseModalities": ["AUDIO"],
-                          "speechConfig": {
-                              "voiceConfig": {
-                                  "prebuiltVoiceConfig": {"voiceName": "Kore"}
-                              }
-                          }
-                      }
-                  },
-                  timeout=300
-              )
-              response.raise_for_status()
-              data = response.json()
-
-              for candidate in data.get("candidates", []):
-                  for part in candidate.get("content", {}).get("parts", []):
-                      inline = part.get("inlineData") or part.get("inline_data")
-                      if inline and inline.get("data"):
-                          return base64.b64decode(inline["data"])
-
-              raise RuntimeError("Gemini returned no narration audio.")
-
-          print("Generating narration...")
-          pcm = generate_audio(narration)
-          audio_path = ROOT / "narration.wav"
-
-          with wave.open(str(audio_path), "wb") as wav:
-              wav.setnchannels(1)
-              wav.setsampwidth(2)
-              wav.setframerate(24000)
-              wav.writeframes(pcm)
-
-          with wave.open(str(audio_path), "rb") as wav:
-              duration = wav.getnframes() / wav.getframerate()
-
-          if duration <= 0:
-              raise RuntimeError("Narration has zero duration.")
-
-          save_text("duration.txt", str(duration))
-
-          HORDE_API = "https://aihorde.net/api/v2"
-          HORDE_HEADERS = {
-              "apikey": "0000000000",
-              "Client-Agent": "AIYouTubeFactory:2.0:GitHubActions"
-          }
-
-          attribution = []
-
-          def generate_ai_image(shot, index):
-              prompt = (
-                  "prompt: Create a realistic cinematic documentary image "
-                  "of this specific subject: "
-                  + shot["visual_search"]
-                  + ". Scene direction: "
-                  + shot["visual_description"]
-                  + ". Narration context: "
-                  + shot["narration"][:450]
-                  + ". Show the named subject clearly and prominently. "
-                  "Use historically appropriate objects, locations, "
-                  "vehicles, uniforms, architecture, and technology. "
-                  "If the subject is a specific ship, aircraft, weapon, "
-                  "or vehicle, make it the main focus. Do not substitute "
-                  "an unrelated generic scene. Realistic materials, "
-                  "natural lighting, detailed environment, wide landscape "
-                  "composition. Illustrative reconstruction, not authentic "
-                  "historical evidence. No text, watermark, logo, or collage. "
-                  "negative: unrelated subject, wrong historical period, "
-                  "blurry, low quality, distorted objects, text, watermark"
-              )
-
-              client = requests.Session()
-              client.headers.update(HORDE_HEADERS)
-
-              try:
-                  response = client.post(
-                      HORDE_API + "/generate/async",
-                      json={
-                          "prompt": prompt,
-                          "params": {
-                              "width": 768,
-                              "height": 448,
-                              "steps": 20,
-                              "n": 1
-                          },
-                          "nsfw": False,
-                          "censor_nsfw": True,
-                          "r2": True
-                      },
-                      timeout=30
-                  )
-                  response.raise_for_status()
-                  request_id = response.json().get("id")
-
-                  if not request_id:
-                      raise RuntimeError("No image generation ID returned.")
-
-                  print(f"Shot {index}/{SHOT_COUNT}: waiting for AI image...")
-                  deadline = time.monotonic() + 120
-
-                  while time.monotonic() < deadline:
-                      time.sleep(5)
-                      check = client.get(
-                          f"{HORDE_API}/generate/check/{request_id}",
-                          timeout=20
-                      )
-                      check.raise_for_status()
-                      status = check.json()
-
-                      if status.get("faulted"):
-                          raise RuntimeError("AI image generation failed.")
-
-                      if status.get("done"):
-                          result = client.get(
-                              f"{HORDE_API}/generate/status/{request_id}",
-                              timeout=30
-                          )
-                          result.raise_for_status()
-                          generations = result.json().get("generations", [])
-
-                          if not generations:
-                              raise RuntimeError("No generated image returned.")
-
-                          image_url = generations[0].get("img", "")
-                          if not image_url.startswith("https://"):
-                              raise RuntimeError("Invalid generated image URL.")
-
-                          downloaded = client.get(image_url, timeout=45)
-                          downloaded.raise_for_status()
-
-                          with Image.open(io.BytesIO(downloaded.content)) as im:
-                              im.verify()
-
-                          destination = IMAGES / f"image-{index:02d}.jpg"
-
-                          with Image.open(io.BytesIO(downloaded.content)) as im:
-                              converted = im.convert("RGB")
-                              if converted.width < 512 or converted.height < 300:
-                                  raise RuntimeError("Image resolution too low.")
-                              converted.save(destination, "JPEG", quality=92)
-
-                          attribution.append({
-                              "shot": index,
-                              "subject": shot["visual_search"],
-                              "source": "AI-generated image",
-                              "note": "Illustrative reconstruction, not authentic historical evidence"
-                          })
-                          return destination
-
-                  raise TimeoutError("AI image generation timed out.")
-
-              finally:
-                  client.close()
-
-          def find_commons_image(shot, index):
-              response = session.get(
-                  "https://commons.wikimedia.org/w/api.php",
-                  params={
-                      "action": "query",
-                      "format": "json",
-                      "generator": "search",
-                      "gsrsearch": shot["visual_search"],
-                      "gsrnamespace": 6,
-                      "gsrlimit": 8,
-                      "prop": "imageinfo",
-                      "iiprop": "url|extmetadata",
-                      "iiurlwidth": 1280
-                  },
-                  timeout=35
-              )
-              response.raise_for_status()
-              pages = response.json().get("query", {}).get("pages", {})
-
-              for page in pages.values():
-                  info_list = page.get("imageinfo", [])
-                  if not info_list:
-                      continue
-
-                  info = info_list[0]
-                  image_url = info.get("thumburl") or info.get("url", "")
-                  if not image_url.startswith("https://"):
-                      continue
-
-                  try:
-                      downloaded = session.get(image_url, timeout=30)
-                      downloaded.raise_for_status()
-
-                      with Image.open(io.BytesIO(downloaded.content)) as im:
-                          im.verify()
-
-                      destination = IMAGES / f"image-{index:02d}.jpg"
-
-                      with Image.open(io.BytesIO(downloaded.content)) as im:
-                          converted = im.convert("RGB")
-                          if converted.width < 400 or converted.height < 220:
-                              continue
-                          converted.save(destination, "JPEG", quality=92)
-
-                      metadata = info.get("extmetadata", {})
-                      license_name = metadata.get(
-                          "LicenseShortName", {}
-                      ).get("value", "Unspecified")
-                      artist = metadata.get("Artist", {}).get(
-                          "value", "Not listed"
-                      )
-                      page_url = (
-                          "https://commons.wikimedia.org/wiki/"
-                          + page.get("title", "").replace(" ", "_")
-                      )
-
-                      attribution.append({
-                          "shot": index,
-                          "subject": shot["visual_search"],
-                          "source": "Wikimedia Commons",
-                          "file": page.get("title", ""),
-                          "file_page": page_url,
-                          "license": license_name,
-                          "artist": re.sub("<[^>]+>", "", artist)
-                      })
-
-                      print(f"Shot {index}/{SHOT_COUNT}: Commons image selected.")
-                      return destination
-
-                  except Exception as exc:
-                      print(f"Skipping Commons image: {exc}")
-
-              return None
-
-          def make_fallback_image(shot, index):
-              width, height = 1920, 1080
-              image = Image.new("RGB", (width, height), (15, 19, 26))
-              draw = ImageDraw.Draw(image)
-
-              for x in range(0, width, 60):
-                  draw.line((x, 0, x, height), fill=(25, 32, 42), width=1)
-
-              for y in range(0, height, 60):
-                  draw.line((0, y, width, y), fill=(25, 32, 42), width=1)
-
-              draw.rectangle(
-                  (55, 55, width - 55, height - 55),
-                  outline=(115, 124, 137), width=3
-              )
-
-              font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
-              bold_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
-
-              try:
-                  font = ImageFont.truetype(font_path, 42)
-                  heading = ImageFont.truetype(bold_path, 56)
-              except OSError:
-                  font = ImageFont.load_default()
-                  heading = font
-
-              draw.text((100, 100), "THE MIDNIGHT ARCHIVE",
-                        font=heading, fill=(236, 232, 220))
-              draw.line((100, 190, width - 100, 190),
-                        fill=(115, 124, 137), width=3)
-              draw.text((100, 245), f"CASE FILE / SHOT {index:02d}",
-                        font=font, fill=(172, 184, 197))
-
-              words = shot["visual_search"].split()
-              lines = []
-              current = ""
-
-              for word in words:
-                  candidate = (current + " " + word).strip()
-                  if draw.textbbox((0, 0), candidate, font=font)[2] < width - 220:
-                      current = candidate
-                  else:
-                      if current:
-                          lines.append(current)
-                      current = word
-
-              if current:
-                  lines.append(current)
-
-              y = 380
-              for line in lines[:6]:
-                  draw.text((100, y), line, font=font, fill=(230, 219, 196))
-                  y += 65
-
-              draw.text((100, height - 145), "VISUAL REFERENCE UNAVAILABLE",
-                        font=font, fill=(172, 184, 197))
-
-              destination = IMAGES / f"image-{index:02d}.jpg"
-              image.save(destination, "JPEG", quality=90)
-
-              attribution.append({
-                  "shot": index,
-                  "subject": shot["visual_search"],
-                  "source": "Fallback case-file graphic",
-                  "note": "No suitable generated or Commons image was available"
-              })
-
-              return destination
-
-          print("Generating subject-matched images...")
-
-          for index, shot in enumerate(shots, start=1):
-              try:
-                  generate_ai_image(shot, index)
-              except Exception as exc:
-                  print(f"Shot {index}: AI generation unavailable: {exc}")
-                  try:
-                      image_path = find_commons_image(shot, index)
-                      if image_path is None:
-                          make_fallback_image(shot, index)
-                  except Exception as commons_exc:
-                      print(f"Shot {index}: Commons search failed: {commons_exc}")
-                      make_fallback_image(shot, index)
-
-          save_text("attribution.json", json.dumps(attribution, indent=2))
-
-          def get_font(size):
-              paths = [
-                  "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-                  "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf"
-              ]
-              for path in paths:
-                  if Path(path).exists():
-                      return ImageFont.truetype(path, size)
-              return ImageFont.load_default()
-
-          def make_shot_video(shot, index):
-              image_path = IMAGES / f"image-{index:02d}.jpg"
-              frame_path = SCENES / f"scene-{index:02d}.mp4"
-
-              with Image.open(image_path) as original:
-                  frame = ImageOps.fit(
-                      original.convert("RGB"),
-                      (1920, 1080),
-                      method=Image.Resampling.LANCZOS
-                  )
-
-              overlay = Image.new("RGBA", frame.size, (0, 0, 0, 0))
-              ImageDraw.Draw(overlay).rectangle(
-                  (0, 0, 1920, 135), fill=(0, 0, 0, 155)
-              )
-              frame = Image.alpha_composite(
-                  frame.convert("RGBA"), overlay
-              ).convert("RGB")
-
-              draw = ImageDraw.Draw(frame)
-              draw.text(
-                  (70, 42), "THE MIDNIGHT ARCHIVE",
-                  font=get_font(40), fill=(255, 255, 255)
-              )
-              draw.text(
-                  (75, 95), f"DOCUMENTARY / SHOT {index:02d}",
-                  font=get_font(28), fill=(220, 220, 220)
-              )
-
-              still_path = SCENES / f"scene-{index:02d}.jpg"
-              frame.save(still_path, "JPEG", quality=93)
-
-              shot_words = len(shot["narration"].split())
-              shot_duration = duration * shot_words / max(total_words, 1)
-
-              subprocess.run([
-                  "ffmpeg", "-y",
-                  "-loop", "1",
-                  "-framerate", "30",
-                  "-i", str(still_path),
-                  "-t", f"{shot_duration:.3f}",
-                  "-vf", "scale=1920:1080,format=yuv420p",
-                  "-r", "30",
-                  "-c:v", "libx264",
-                  "-preset", "veryfast",
-                  "-crf", "23",
-                  "-an",
-                  str(frame_path)
-              ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-
-          print("Rendering timed video shots...")
-
-          for index, shot in enumerate(shots, start=1):
-              make_shot_video(shot, index)
-
-          concat_file = SCENES / "concat.txt"
-
-          with concat_file.open("w", encoding="utf-8") as file:
-              for index in range(1, SHOT_COUNT + 1):
-                  path = (SCENES / f"scene-{index:02d}.mp4").resolve()
-                  file.write("file '" + str(path) + "'\n")
-
-          silent_video = ROOT / "silent.mp4"
-
-          subprocess.run([
-              "ffmpeg", "-y",
-              "-f", "concat",
-              "-safe", "0",
-              "-i", str(concat_file),
-              "-c:v", "libx264",
-              "-preset", "veryfast",
-              "-crf", "23",
-              "-pix_fmt", "yuv420p",
-              str(silent_video)
-          ], check=True)
-
-          final_video = ROOT / "final-video.mp4"
-
-          subprocess.run([
-              "ffmpeg", "-y",
-              "-i", str(silent_video),
-              "-i", str(audio_path),
-              "-map", "0:v:0",
-              "-map", "1:a:0",
-              "-c:v", "copy",
-              "-c:a", "aac",
-              "-b:a", "192k",
-              "-shortest",
-              "-movflags", "+faststart",
-              str(final_video)
-          ], check=True)
-
-          print("Creating subtitles...")
-
-          seconds_per_word = duration / max(total_words, 1)
-          srt_lines = []
-          word_cursor = 0
-          subtitle_index = 1
-
-          def timestamp(seconds):
-              milliseconds = int(round(seconds * 1000))
-              hours = milliseconds // 3600000
-              milliseconds %= 3600000
-              minutes = milliseconds // 60000
-              milliseconds %= 60000
-              secs = milliseconds // 1000
-              milliseconds %= 1000
-              return (
-                  f"{hours:02}:{minutes:02}:"
-                  f"{secs:02},{milliseconds:03}"
-              )
-
-          for shot in shots:
-              words = shot["narration"].split()
-
-              for offset in range(0, len(words), 8):
-                  chunk = words[offset:offset + 8]
-                  start = word_cursor * seconds_per_word
-                  end = min(
-                      (word_cursor + len(chunk)) * seconds_per_word,
-                      duration
-                  )
-
-                  srt_lines.extend([
-                      str(subtitle_index),
-                      f"{timestamp(start)} --> {timestamp(end)}",
-                      " ".join(chunk),
-                      ""
-                  ])
-
-                  word_cursor += len(chunk)
-                  subtitle_index += 1
-
-          save_text("captions.srt", "\n".join(srt_lines))
-          save_text("attribution.json", json.dumps(attribution, indent=2))
-
-          source_lines = []
-          for source in story.get("sources", []):
-              if isinstance(source, dict) and source.get("name") and source.get("url"):
-                  source_lines.append(f'{source["name"]}: {source["url"]}')
-
-          image_lines = []
-          for item in attribution:
-              if item.get("source") == "Wikimedia Commons":
-                  image_lines.append(
-                      f'Shot {item["shot"]}: {item.get("file", "Image")} - '
-                      f'{item.get("artist", "Artist not listed")}; '
-                      f'{item.get("license", "License not listed")}; '
-                      f'{item.get("file_page", "")}'
-                  )
-
-          upload_description = description
-
-          if source_lines:
-              upload_description += "\n\nSOURCES\n" + "\n".join(source_lines)
-
-          if image_lines:
-              upload_description += "\n\nIMAGE CREDITS\n" + "\n".join(image_lines)
-
-          upload_description += (
-              "\n\nVisual note: AI-generated images are illustrative "
-              "reconstructions, not authentic historical photographs. "
-              "Historical claims and source links should be checked before "
-              "publishing."
-          )
-
-          save_text("upload-description.txt", upload_description[:5000])
-          save_text(
-              "upload-notes.txt",
-              "Review the source links and historical claims before publishing. "
-              "See attribution.json for image sources and licenses."
-          )
-
-          print("Connecting to YouTube...")
+          title = ("The Mystery of " + topic).strip()
+          if len(title) > 95:
+              title = title[:92].rstrip() + "..."
+
+          description_lines = [
+              "A historical documentary exploring the evidence, leading theories, "
+              "and unanswered questions surrounding " + topic + ".",
+              "",
+              "This episode distinguishes documented evidence from disputed claims "
+              "and speculation.",
+              "",
+              "IMAGE CREDITS AND LICENCES",
+          ]
+
+          for item in attributions:
+              title_text = item.get("title", "Wikimedia Commons image")
+              creator = item.get("creator") or item.get("attribution") or "Creator not listed"
+              license_name = item.get("license") or "Licence listed on source page"
+              source_url = item.get("foreign_landing_url") or ""
+              license_url = item.get("license_url") or ""
+              credit = f"- {title_text} — {creator}; {license_name}"
+              if source_url:
+                  credit += f"; source: {source_url}"
+              if license_url:
+                  credit += f"; licence: {license_url}"
+              description_lines.append(credit)
+
+          description_lines += [
+              "",
+              "Narration and background music were generated for this video. "
+              "The historical content should be checked against reliable sources; "
+              "this video is intended for education and entertainment.",
+          ]
+          description = "\n".join(description_lines)[:4900]
 
           credentials = Credentials(
               token=None,
@@ -726,69 +855,56 @@ jobs:
               token_uri="https://oauth2.googleapis.com/token",
               client_id=os.environ["YOUTUBE_CLIENT_ID"],
               client_secret=os.environ["YOUTUBE_CLIENT_SECRET"],
-              scopes=["https://www.googleapis.com/auth/youtube.upload"]
+              scopes=["https://www.googleapis.com/auth/youtube.upload"],
           )
+          youtube = build("youtube", "v3", credentials=credentials)
 
-          youtube = build(
-              "youtube", "v3",
-              credentials=credentials,
-              cache_discovery=False
-          )
-
-          request_body = {
-              "snippet": {
-                  "title": title[:100],
-                  "description": upload_description[:5000],
-                  "categoryId": "27",
-                  "tags": [
-                      "investigation", "history", "documentary",
-                      "historical mysteries", "real events",
-                      "The Midnight Archive"
-                  ],
-                  "defaultLanguage": "en"
-              },
-              "status": {
-                  "privacyStatus": "private",
-                  "selfDeclaredMadeForKids": False
-              }
-          }
-
-          upload = youtube.videos().insert(
+          request = youtube.videos().insert(
               part="snippet,status",
-              body=request_body,
+              body={
+                  "snippet": {
+                      "title": title,
+                      "description": description,
+                      "categoryId": "27",
+                      "defaultLanguage": "en-GB",
+                  },
+                  "status": {
+                      "privacyStatus": "private",
+                      "selfDeclaredMadeForKids": False,
+                  },
+              },
               media_body=MediaFileUpload(
-                  str(final_video),
+                  str(video_path),
                   mimetype="video/mp4",
-                  resumable=True
-              )
+                  chunksize=8 * 1024 * 1024,
+                  resumable=True,
+              ),
           )
 
-          result = None
-
-          while result is None:
-              status, result = upload.next_chunk()
+          response = None
+          while response is None:
+              status, response = request.next_chunk()
               if status:
-                  print(f"Upload progress: {int(status.progress() * 100)}%")
+                  print(f"YouTube upload progress: {int(status.progress() * 100)}%")
 
-          video_id = result.get("id", "")
-          save_text("youtube-video-id.txt", video_id)
-          save_text(
-              "youtube-video-url.txt",
-              "https://www.youtube.com/watch?v=" + video_id
+          video_id = response.get("id")
+          if not video_id:
+              raise SystemExit("YouTube did not return a video ID.")
+
+          print("Upload complete. Video is PRIVATE pending your review.")
+          print("YouTube Studio URL: https://studio.youtube.com/video/" + video_id + "/edit")
+          (out / "youtube-upload.txt").write_text(
+              "Video ID: " + video_id + "\n"
+              + "Studio URL: https://studio.youtube.com/video/" + video_id + "/edit\n"
+              + "Privacy: private\n",
+              encoding="utf-8",
           )
+          PY
 
-          print("Upload completed.")
-          print("Video ID: " + video_id)
-          print("The video is private until you change its visibility.")
-          PYTHON
-
-          python build.py
-
-      - name: Save generated video and project files
-        if: always()
+      - name: Upload finished video and source files
         uses: actions/upload-artifact@v4
         with:
-          name: ai-youtube-factory-output
+          name: mystery-documentary-video
           path: output/
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 7
