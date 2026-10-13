@@ -244,7 +244,7 @@ jobs:
           SOURCE MATERIAL (headlines, summaries, publication dates and URLs from live news feeds):
           {research}
 
-          Write 500–650 spoken words in natural British English. Open with the most important verified
+          Write 650–800 spoken words in natural British English. Aim for about 725 words, and never return fewer than 600 words. Open with the most important verified
           development and its date. Explain what happened, who is involved, why it matters now, what is
           confirmed, what remains uncertain, and what to watch next. Make the story understandable to a
           viewer who has not followed it before.
@@ -285,8 +285,43 @@ jobs:
           if not script:
               raise SystemExit("Script generation returned empty text.")
 
+          word_count = len(script.split())
+          if word_count < 600:
+              print(f"Narration draft is only {word_count} words; asking Gemini to expand it.")
+              expansion_prompt = f"""You are the research writer for SIGNAL BRIEF. Expand the narration below into 650–800 spoken words in natural British English, aiming for about 725 words. Preserve its factual meaning and only use information supported by the narration and source material. Do not add invented facts, quotes, dates, numbers, motives, or predictions. Add useful verified context, explain why the development matters, clarify what is known and uncertain, and end with what to watch next. Return only the complete spoken narration, with no title, headings, bullet points, citations, or production notes.
+          
+          SOURCE MATERIAL:
+          {research}
+          
+          CURRENT NARRATION:
+          {script}"""
+              expansion_response = gemini_post(
+                  "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent",
+                  headers={"x-goog-api-key": key},
+                  json={
+                      "contents": [{"parts": [{"text": expansion_prompt}]}],
+                      "generationConfig": {"temperature": 0.5, "maxOutputTokens": 2200}
+                  },
+                  timeout=(20, 300)
+              )
+              expansion_response.raise_for_status()
+              expansion_data = expansion_response.json()
+              expanded_script = "".join(
+                  part.get("text", "")
+                  for part in expansion_data["candidates"][0]["content"]["parts"]
+              ).strip()
+              if expanded_script:
+                  script = expanded_script
+                  word_count = len(script.split())
+
+          if word_count < 500:
+              raise SystemExit(
+                  f"Narration generation failed: only {word_count} words after expansion; "
+                  "at least 500 are required. Rerun the workflow to try again."
+              )
+
           (out / "script.txt").write_text(script, encoding="utf-8")
-          print("Script generated.")
+          print(f"Script generated: {word_count} words.")
 
           payload = {
               "contents": [{"parts": [{"text": script}]}],
