@@ -9,7 +9,7 @@ permissions:
 jobs:
   build-video:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 45
 
     steps:
       - name: Check out repository
@@ -39,6 +39,7 @@ jobs:
           import re
           import html
           import random
+          import time
           from pathlib import Path
           from PIL import Image
 
@@ -46,6 +47,32 @@ jobs:
           out = Path("output")
           images = out / "images"
           images.mkdir(parents=True, exist_ok=True)
+
+          def gemini_post(url, **kwargs):
+              kwargs["timeout"] = (20, 300)
+              last_error = None
+              for attempt in range(4):
+                  try:
+                      result = requests.post(url, **kwargs)
+                      if result.status_code not in (408, 429, 500, 502, 503, 504):
+                          return result
+                      last_error = RuntimeError(
+                          f"Gemini returned HTTP {result.status_code}: {result.text[:500]}"
+                      )
+                      if attempt == 3:
+                          result.raise_for_status()
+                          return result
+                  except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as error:
+                      last_error = error
+                      if attempt == 3:
+                          raise RuntimeError(
+                              "Gemini API timed out after 4 attempts. "
+                              "Wait a few minutes and rerun the workflow."
+                          ) from error
+                  wait_seconds = 5 * (2 ** attempt)
+                  print(f"Gemini request attempt {attempt + 1} failed; retrying in {wait_seconds}s.")
+                  time.sleep(wait_seconds)
+              raise RuntimeError(f"Gemini request failed: {last_error}")
 
           topics = [
               "the Mary Celeste and the evidence behind its abandonment",
@@ -92,7 +119,7 @@ jobs:
           - Return only the spoken narration. Do not include a title, headings, bullet points,
             citations, stage directions, or notes to the editor."""
 
-          response = requests.post(
+          response = gemini_post(
               "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent",
               headers={"x-goog-api-key": key},
               json={
@@ -102,7 +129,7 @@ jobs:
                       "maxOutputTokens": 2400
                   }
               },
-              timeout=90
+              timeout=(20, 300)
           )
           response.raise_for_status()
           data = response.json()
@@ -131,14 +158,14 @@ jobs:
               }
           }
 
-          response = requests.post(
+          response = gemini_post(
               "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-tts:generateContent",
               headers={
                   "x-goog-api-key": key,
                   "Content-Type": "application/json"
               },
               json=payload,
-              timeout=180
+              timeout=(20, 300)
           )
 
           if not response.ok:
@@ -199,7 +226,7 @@ jobs:
                   })
 
           visual_input = visual_prompt + json.dumps(passages, ensure_ascii=False)
-          visual_response = requests.post(
+          visual_response = gemini_post(
               "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent",
               headers={"x-goog-api-key": key},
               json={
@@ -210,7 +237,7 @@ jobs:
                       "responseMimeType": "application/json"
                   }
               },
-              timeout=90
+              timeout=(20, 300)
           )
           visual_response.raise_for_status()
           visual_data = visual_response.json()
