@@ -188,20 +188,14 @@ jobs:
           # Discover major non-political stories people are discussing online.
           # These searches are leads, not proof that a topic is trending.
           topic_searches = [
-              "Jeffrey Epstein files documents new development latest reporting when:7d",
-              "Sean Combs Diddy case new development latest reporting when:7d",
-              "Bohemian Grove investigation documentary fact check latest reporting when:7d",
-              "major celebrity controversy new development reporting when:7d",
-              "viral influencer controversy investigation latest reporting when:7d",
-              "major true crime case new development reporting when:7d",
-              "internet mystery viral claim fact check reporting when:7d",
-              "celebrity lawsuit court case new development entertainment when:7d",
-              "viral internet scandal documentary investigation when:7d",
-              "major entertainment controversy streaming documentary when:7d",
-              "viral social media claim fact check X TikTok Reddit when:7d",
-              "strange unexplained event viral online discussion verified reporting when:7d",
-              "major technology controversy viral social media reporting when:7d",
-              "major sports or entertainment scandal latest reporting when:7d",
+              "viral internet mystery claim fact check evidence social media when:7d",
+              "major online conspiracy claim investigation fact check when:7d",
+              "celebrity scandal controversy investigation court documents when:7d",
+              "high profile case viral claims evidence fact check when:7d",
+              "Epstein alive claim fact check evidence social media when:30d",
+              "Bohemian Grove claims investigation evidence fact check when:30d",
+              "Diddy online claims misinformation fact check when:30d",
+              "viral celebrity controversy misinformation investigation when:7d",
           ]
 
           def is_political_topic(value):
@@ -220,10 +214,17 @@ jobs:
               ]
               return any(re.search(pattern, text_value) for pattern in political_patterns)
 
-          topic_searches.extend(
-              signal + " latest reporting when:7d"
-              for signal in social_topic_signals[:18]
+          signal_candidates = [
+              signal for signal in social_topic_signals
               if not is_political_topic(signal)
+              and not any(term in signal.lower() for term in (
+                  "official trailer", "music video", "official video", "new song",
+                  "new album", "minecraft", "gameplay", "reaction compilation"
+              ))
+          ]
+          topic_searches.extend(
+              signal + " fact check claims evidence social media when:7d"
+              for signal in signal_candidates[:10]
           )
 
           now = datetime.now(timezone.utc)
@@ -283,7 +284,7 @@ jobs:
                               published_at = now - timedelta(hours=12)
                       summary = re.sub(r"<[^>]+>", " ", summary)
                       summary = html.unescape(re.sub(r"\s+", " ", summary)).strip()
-                      if headline and link.startswith("http") and published_at >= now - timedelta(hours=72):
+                      if headline and link.startswith("http") and published_at >= now - timedelta(days=30):
                           news_items.append({
                               "source": source_name,
                               "headline": headline,
@@ -308,23 +309,48 @@ jobs:
               ignored = {"the", "and", "for", "with", "from", "that", "this", "says", "after", "over", "into", "amid", "what", "why", "how", "its", "their", "has", "have", "are", "was", "were"}
               return {word for word in re.findall(r"[a-z0-9]+", value.lower()) if len(word) > 2 and word not in ignored}
 
+          investigative_terms = (
+              "epstein", "diddy", "sean combs", "bohemian grove", "conspiracy",
+              "mystery", "fact check", "fact-check", "viral claim", "misinformation",
+              "scandal", "controversy", "investigation", "unsealed", "court documents",
+              "leaked", "files", "cover-up", "alive", "missing", "debunked", "myth",
+              "rumour", "rumor", "allegation", "evidence", "secret", "hidden", "hoax",
+              "deepfake", "fraud", "lawsuit", "cult", "internet theory", "social media claim"
+          )
+          routine_entertainment_terms = (
+              "official trailer", "new trailer", "music video", "official video",
+              "new single", "new album", "album release", "release date", "teaser trailer",
+              "box office", "episode recap", "season premiere"
+          )
+
+          def investigative_relevance(item):
+              combined = (item["headline"] + " " + item["summary"]).lower()
+              score = sum(3 for term in investigative_terms if term in combined)
+              if any(term in combined for term in ("epstein", "diddy", "sean combs", "bohemian grove")):
+                  score += 5
+              if any(term in combined for term in routine_entertainment_terms):
+                  score -= 7
+              return score
+
           for item in news_items:
-              own = headline_tokens(item["headline"])
+              own = headline_tokens(item["headline"] + " " + item["summary"])
               corroborating = []
               for other in news_items:
                   if other is item or other["source"] == item["source"]:
                       continue
-                  other_tokens = headline_tokens(other["headline"])
+                  other_tokens = headline_tokens(other["headline"] + " " + other["summary"])
                   overlap = len(own & other_tokens) / max(1, len(own | other_tokens))
                   if overlap >= 0.22:
                       corroborating.append(other)
               item["corroborating"] = corroborating
               item["story_score"] = len({other["source"] for other in corroborating})
+              item["investigative_relevance"] = investigative_relevance(item)
 
           social_research_items = [
               item for item in news_items
               if item["source"].startswith("Social topic research:")
               and not is_political_topic(item["headline"] + " " + item["summary"])
+              and item["investigative_relevance"] >= 3
           ]
 
           # General feeds can corroborate a chosen story, but should not cause
@@ -340,22 +366,34 @@ jobs:
               selected_item = max(
                   social_research_items,
                   key=lambda item: (
+                      item["investigative_relevance"],
                       item["story_score"],
                       item["published_dt"] >= now - timedelta(hours=24),
                       item["published_dt"]
                   )
               )
-              print("Prioritising a recent non-political story connected to online discussion: " + selected_item["headline"])
+              print("Prioritising an investigative internet-culture story with recent reporting: " + selected_item["headline"])
           else:
+              eligible_deep_dive_items = [
+                  item for item in non_political_items
+                  if item["investigative_relevance"] >= 3
+              ]
+              if not eligible_deep_dive_items:
+                  raise SystemExit(
+                      "No suitable investigative story about a major online controversy, mystery, "
+                      "scandal or disputed viral claim has enough recent reporting. The workflow will "
+                      "stop rather than create an unrelated routine news video. Rerun later."
+                  )
               selected_item = max(
-                  non_political_items,
+                  eligible_deep_dive_items,
                   key=lambda item: (
+                      item["investigative_relevance"],
                       item["story_score"],
                       item["published_dt"] >= now - timedelta(hours=24),
                       item["published_dt"]
                   )
               )
-              print("No eligible social-discussion lead had recent reporting; using the strongest available non-political story.")
+              print("Selected the strongest supported investigative story: " + selected_item["headline"])
           related_items = [selected_item] + selected_item["corroborating"]
           related_items = sorted(related_items, key=lambda item: item["published_dt"], reverse=True)[:6]
           topic = selected_item["headline"]
@@ -419,9 +457,61 @@ jobs:
               for item in news_sources
           )
 
-          prompt = f"""You are the research writer for SIGNAL BRIEF, a current-affairs YouTube channel.
-          Create a clear, compelling, accurate news explainer based on the recent source material below.
-          Selected story: {topic}
+          social_discussion_items = []
+          discussion_queries = [
+              topic,
+              " ".join(re.findall(r"[a-zA-Z0-9]+", topic)[:5]) + " theory",
+              " ".join(re.findall(r"[a-zA-Z0-9]+", topic)[:5]) + " fact check",
+          ]
+          for discussion_query in discussion_queries:
+              try:
+                  discussion_response = requests.get(
+                      "https://www.reddit.com/search.json",
+                      params={"q": discussion_query, "sort": "relevance", "t": "month", "limit": 8},
+                      headers={"User-Agent": "SignalBrief/1.0 (public discussion research; educational documentary)"},
+                      timeout=18
+                  )
+                  if discussion_response.status_code == 429:
+                      print("Reddit topic search rate-limited; continuing with available public sources.")
+                      time.sleep(5)
+                      continue
+                  discussion_response.raise_for_status()
+                  posts = discussion_response.json().get("data", {}).get("children", [])
+                  for post in posts:
+                      post_data = post.get("data", {})
+                      post_title = clean_text(post_data.get("title", ""))
+                      if not post_title:
+                          continue
+                      record = {
+                          "subreddit": post_data.get("subreddit", "unknown"),
+                          "title": post_title[:300],
+                          "text": clean_text(post_data.get("selftext", ""))[:900],
+                          "score": int(post_data.get("score", 0) or 0),
+                          "comments": int(post_data.get("num_comments", 0) or 0),
+                          "url": "https://www.reddit.com" + post_data.get("permalink", "")
+                      }
+                      if record["url"] and not any(existing["url"] == record["url"] for existing in social_discussion_items):
+                          social_discussion_items.append(record)
+                  time.sleep(2)
+              except Exception as error:
+                  print(f"Could not retrieve public Reddit discussion for '{discussion_query}': {error}")
+
+          social_discussion_items.sort(key=lambda item: (item["comments"], item["score"]), reverse=True)
+          discussion_context = "\n\n".join(
+              f"PUBLIC DISCUSSION LEAD (not proof): r/{item['subreddit']} | title: {item['title']} | post text: {item['text']} | score: {item['score']} | comments: {item['comments']} | URL: {item['url']}"
+              for item in social_discussion_items[:18]
+          )
+          if discussion_context:
+              research += "\n\nPUBLIC SOCIAL DISCUSSION LEADS — USE ONLY TO IDENTIFY CLAIMS AND MISCONCEPTIONS, NEVER AS EVIDENCE OF FACT:\n" + discussion_context
+          else:
+              research += "\n\nNo topic-specific public Reddit discussion was accessible this run. Do not invent what people online are saying."
+          (out / "social-discussions.json").write_text(
+              json.dumps(social_discussion_items[:18], indent=2, ensure_ascii=False),
+              encoding="utf-8"
+          )
+
+          prompt = f"""You are the lead investigative video essay writer for SIGNAL BRIEF. Write like a sharp, modern YouTube documentary creator who is curious, sceptical, clear and engaging—not like a newsreader reading headlines.
+          Selected research lead: {topic}
           Current UTC date: {now.strftime('%Y-%m-%d')}
 
           SOCIAL DISCUSSION SIGNALS (Google Trends and public Reddit discussions; discovery clues only, not evidence of factual claims):
@@ -430,15 +520,26 @@ jobs:
           SOURCE MATERIAL (recent news reports, dates, summaries, article excerpts and URLs; includes searches around high-discussion topics such as Epstein-related documents, the Diddy case, Bohemian Grove, and other current online controversies):
           {research}
 
-          Choose a major NON-POLITICAL story that people are actively discussing online, supported by recent reporting. The channel covers internet controversies and mysteries, celebrity and influencer scandals, high-profile criminal/legal cases, viral claims that need fact-checking, entertainment controversies, major documentaries, unusual events, and major technology or culture stories. Epstein-related developments, the Sean Combs/Diddy case, and Bohemian Grove are examples of the kind of story the channel may cover when there is a genuine current development. Do NOT choose elections, party politics, politicians, government policy, routine parliamentary news, or geopolitical debate. Use social discussion signals only to discover candidates, never as proof that a claim is true. If no social-discussion candidate has credible recent reporting, choose the strongest well-supported non-political story. Never claim a topic is viral or trending unless multiple supplied signals support that wording, and never invent popularity statistics.
+          Choose an investigative QUESTION, not a routine news update. The channel covers major internet mysteries, high-profile scandals, celebrity/influencer controversies, public-record mysteries, viral claims, alleged cover-ups, strange online theories, and misconceptions that deserve a proper evidence-led deep dive. Example framing: “Is Jeffrey Epstein Still Alive? Investigating the Claims” is a better format than a generic headline about a new court update. Epstein, Diddy and Bohemian Grove are examples of subject areas, not automatic choices. Pick them only when the supplied signals and evidence make a meaningful investigation possible. Avoid politics, elections, government policy, and routine daily headlines. Do not pick a random music/video release merely because it is trending. Use social posts to identify what people are asking or getting wrong, never as proof. If no suitable deep-dive topic has credible sources, stop rather than publish an unrelated story.
 
-          Write 650–800 spoken words in natural British English. Aim for about 725 words, and never return fewer than 600 words. Open with the most important verified
-          development and its date. Explain what happened, who is involved, why it matters now, what is
-          confirmed, what remains uncertain, and what to watch next. Make the story understandable to a
-          viewer who has not followed it before.
+          Write 1,000–1,300 spoken words in natural British English, aiming for about 1,150. Structure the narration like a high-retention YouTube investigation:
+          1. Open with a gripping question and a specific, verified reason people are asking it now; no generic channel intro.
+          2. Explain the origin of the claim or mystery and why it spread online.
+          3. Build a clear timeline of the key events and the strongest available evidence.
+          4. Examine the main arguments people use to support the popular theory, one by one, and explain what the evidence actually shows.
+          5. Investigate common misconceptions, misleading clips/images, missing context, and claims that cannot be verified.
+          6. Present the strongest counter-evidence and plausible alternative explanations fairly.
+          7. Separate confirmed facts, reasonable inferences, unresolved questions, and unsupported speculation.
+          8. End with a clear evidence-based verdict and what new evidence would genuinely change the assessment.
+          Keep the pace conversational, curious and analytical. Use mini-reveals and transitions to maintain interest, but do not manufacture suspense or pretend weak evidence is a breakthrough.
 
           Research and accuracy rules:
-          - Use only claims supported by the source material or uncontroversial background context.
+          - Use only claims supported by the supplied source material or clearly labelled, well-established background context.
+          - Treat social media theories as claims to investigate, not facts. Explain the strongest version of the claim before assessing it.
+          - Use the supplied public discussion leads to identify the most common questions, arguments and misconceptions; do not describe a claim as common or widespread unless the supplied discussion signals actually support that description.
+          - For each major online claim, explain why people find it convincing, what evidence they point to, what context is missing, and whether the available evidence supports it. If the discussion sample is weak or unrepresentative, say so.
+          - Identify the original source of key images, videos, documents or quotes where supplied sources allow it; distinguish primary records from commentary about them.
+          - Never say you personally browsed a platform, watched a video, or inspected a document unless the source material actually provides it.
           - Attribute allegations, official statements and disputed claims to the source or named speaker.
           - Do not invent quotes, numbers, dates, eyewitness details, motives, or future outcomes.
           - If only one source covers a claim, explicitly frame it as that outlet's reporting rather than
@@ -446,8 +547,9 @@ jobs:
             sources genuinely support the same event.
           - If source summaries disagree or details are missing, state that clearly instead of guessing.
           - Avoid sensationalism, partisan advocacy, graphic detail, and presenting speculation as fact.
-          - Do not use generic filler or a long channel introduction. End with the key implication and
-            the next development viewers should monitor, without pretending to predict the future.
+          - Do not use generic filler or a long channel introduction. Keep it specific to the central question and useful to viewers.
+          - Do not repeat the same fact to pad the word count. If evidence is limited, explain the limits rather than inventing detail.
+          - End with a direct, nuanced answer to the opening question and identify what evidence would change that answer.
           - Return only spoken narration. No title, headings, bullet points, citations, stage directions,
             or production notes."""
 
@@ -458,7 +560,7 @@ jobs:
                   "contents": [{"parts": [{"text": prompt}]}],
                   "generationConfig": {
                       "temperature": 0.7,
-                      "maxOutputTokens": 1800
+                      "maxOutputTokens": 3400
                   }
               },
               timeout=(20, 300)
@@ -474,9 +576,9 @@ jobs:
               raise SystemExit("Script generation returned empty text.")
 
           word_count = len(script.split())
-          if word_count < 600:
-              print(f"Narration draft is only {word_count} words; asking Gemini to expand it.")
-              expansion_prompt = f"""You are the research writer for SIGNAL BRIEF. Expand the narration below into 650–800 spoken words in natural British English, aiming for about 725 words. Preserve its factual meaning and only use information supported by the narration and source material. Do not add invented facts, quotes, dates, numbers, motives, or predictions. Add useful verified context, explain why the development matters, clarify what is known and uncertain, and end with what to watch next. Return only the complete spoken narration, with no title, headings, bullet points, citations, or production notes.
+          if word_count < 1000:
+              print(f"Narration draft is only {word_count} words; asking Gemini to expand the investigation.")
+              expansion_prompt = f"""You are the lead writer for SIGNAL BRIEF's investigative YouTube video essays. Expand the narration below into 1,000–1,300 spoken words in natural British English. Preserve factual meaning and use only information supported by the supplied research. Do not invent facts, quotes, dates, numbers, motives or sources. Deepen the investigation by explaining the origin of the claim, the strongest evidence on each side, what social media commonly gets wrong, what reliable records actually establish, and what remains uncertain. Do not turn it into a routine news bulletin. Return only the complete narration, with no title, headings, bullet points, citations or production notes.
           
           SOURCE MATERIAL:
           {research}
@@ -502,14 +604,39 @@ jobs:
                   script = expanded_script
                   word_count = len(script.split())
 
-          if word_count < 500:
+          if word_count < 900:
               raise SystemExit(
                   f"Narration generation failed: only {word_count} words after expansion; "
-                  "at least 500 are required. Rerun the workflow to try again."
+                  "at least 900 are required for an investigative deep dive. Rerun the workflow to try again."
               )
 
           (out / "script.txt").write_text(script, encoding="utf-8")
-          print(f"Script generated: {word_count} words.")
+          print(f"Investigative narration generated: {word_count} words.")
+
+          title_prompt = f"""Create one accurate, compelling YouTube title for this SIGNAL BRIEF investigative video essay.
+          Prefer a clear question followed by an investigation framing, such as 'Is [claim] True? Investigating the Evidence' or 'What Really Happened to [subject]?'. Do not copy a news headline, do not use ALL CAPS, and do not imply a claim is true if the script investigates it. Make it intriguing but not misleading, ideally 45–75 characters and no more than 95 characters. Return only the title, with no quotation marks or explanation.
+          Research lead: {topic}
+          Narration: {script[:9000]}"""
+          title_response = gemini_post(
+              "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent",
+              headers={"x-goog-api-key": key},
+              json={
+                  "contents": [{"parts": [{"text": title_prompt}]}],
+                  "generationConfig": {"temperature": 0.45, "maxOutputTokens": 120}
+              },
+              timeout=(20, 300)
+          )
+          title_response.raise_for_status()
+          title_data = title_response.json()
+          video_title = "".join(
+              part.get("text", "")
+              for part in title_data["candidates"][0]["content"]["parts"]
+          ).strip().strip('"“”')
+          video_title = re.sub(r"\s+", " ", video_title).strip()
+          if not video_title or len(video_title) > 95:
+              video_title = "The Evidence Behind " + topic
+          (out / "video-title.txt").write_text(video_title, encoding="utf-8")
+          print("Generated investigative title: " + video_title)
 
           payload = {
               "contents": [{"parts": [{"text": script}]}],
@@ -566,23 +693,17 @@ jobs:
           print("Narration generated.")
 
 
-          visual_prompt = f"""You are the visual researcher for SIGNAL BRIEF, a current-affairs news video.
-          The narration is divided into very short sequential passages. Return ONLY valid JSON:
-          {{"scenes":[{{"index":1,"title":"specific visual subject","query":"specific Wikimedia Commons search phrase"}}]}}
-          Create exactly one scene for every passage, preserving every index and the order.
-          Each image must directly illustrate the exact words in that passage, not merely the general story.
-          Use named people, places, buildings, maps, transport, public events, relevant documents, landscapes,
-          company logos or other factual context only when supported by the current story and source material.
-          Never invent a photo or imply a stock image depicts the actual event if it does not. For a passage
-          with no concrete visual noun, use a relevant location, organisation, person or factual context from
-          the supplied current story. Do not search for weapons or ordnance; use the surrounding location,
-          people, records or context instead. Queries should be specific, 3–7 words, and searchable on
-          Wikimedia Commons. Avoid generic mood words. Current story: {topic}
+          visual_prompt = f"""You are the visual editor for a modern investigative YouTube documentary for SIGNAL BRIEF.
+          Return ONLY valid JSON:
+          {{"scenes":[{{"index":1,"keyword":"one concrete visual keyword or short phrase","title":"specific visual subject","query":"specific Wikimedia Commons search phrase"}}]}}
+          Create exactly one visual beat for every narration passage, preserving all indices and order. Passages are short so image changes generally follow the narration every few seconds, not at arbitrary section boundaries. Every beat must have ONE main keyword phrase that names the most important concrete person, place, document, object, event or claim in that passage. The keyword is the image-change trigger: each keyword must receive its own corresponding image, and the next beat must switch to its own image. Never use generic filler keywords like “news”, “story”, “controversy” or “documentary”.
+          The image must directly illustrate the spoken passage at that moment, not just the overall topic. Prefer a specific named person, location, court record, dated public document, relevant building, original public photo, map, or verifiable object. If the passage introduces a new named person, location, record, claim or piece of evidence, make that the keyword. If no new entity appears, choose the most useful visual detail already established in the passage.
+          Never imply a stock image depicts the actual event if it does not. Queries should be specific, 3–7 words, and searchable on Wikimedia Commons. Avoid generic mood words. The visual changes must follow the narration and must never be less than 1.0 second apart; the beat timings are calculated from the audio duration and passage length. Current investigation: {topic}
 
           PASSAGES:
           """
           script_words = script.split()
-          chunk_size = 14
+          chunk_size = 18
           scene_count = (len(script_words) + chunk_size - 1) // chunk_size
           passages = []
           for index in range(scene_count):
@@ -659,7 +780,7 @@ jobs:
               except OSError:
                   heading_font = ImageFont.load_default()
                   body_font = ImageFont.load_default()
-              draw.text((180, 205), "CURRENT NEWS CONTEXT", font=body_font, fill=(155, 177, 201))
+              draw.text((180, 205), "SIGNAL BRIEF INVESTIGATION", font=body_font, fill=(155, 177, 201))
               title_lines = []
               current = ""
               for word in (title or "Documentary context").split():
@@ -810,19 +931,19 @@ jobs:
                   "story", "stories", "audiences", "people", "content", "channel", "channels"
               }
 
-          def scene_search_queries(search_query, scene_title, passage_text):
-              passage_terms = sorted(tokens(passage_text))
-              topic_terms = sorted(tokens(topic))
+          def scene_search_queries(search_query, scene_title, passage_text, keyword):
               passage_ordered = re.findall(r"[a-z0-9]+", passage_text.lower())
+              keyword_ordered = re.findall(r"[a-z0-9]+", (keyword or "").lower())
               topic_ordered = re.findall(r"[a-z0-9]+", topic.lower())
               meaningful_passage = [word for word in passage_ordered if word not in tokens_ignored()]
+              meaningful_keyword = [word for word in keyword_ordered if word not in tokens_ignored()]
               meaningful_topic = [word for word in topic_ordered if word not in tokens_ignored()]
               variants = [
                   search_query,
+                  " ".join(meaningful_keyword[:5]),
                   scene_title,
                   " ".join(meaningful_passage[:5]),
-                  " ".join(meaningful_topic[:5]),
-                  " ".join((meaningful_topic[:3] + meaningful_passage[:3])),
+                  " ".join((meaningful_keyword[:3] + meaningful_passage[:2])),
               ]
               result = []
               for value in variants:
@@ -833,12 +954,15 @@ jobs:
 
           for scene_index, passage in enumerate(passages, start=1):
               planned = scene_by_index.get(scene_index, {})
-              scene_title = clean_text(planned.get("title", "")) or f"Story context {scene_index}"
+              scene_title = clean_text(planned.get("title", "")) or f"Investigation visual {scene_index}"
+              keyword = clean_text(planned.get("keyword", ""))
               search_query = clean_text(planned.get("query", ""))
+              if len(tokens(keyword)) < 1:
+                  keyword = scene_title
               if len(tokens(search_query)) < 2:
-                  search_query = scene_title
-              queries = scene_search_queries(search_query, scene_title, passage["text"])
-              print(f"Scene {scene_index:02d} image search queries: {queries}")
+                  search_query = keyword
+              queries = scene_search_queries(search_query, scene_title, passage["text"], keyword)
+              print(f"Scene {scene_index:02d} keyword '{keyword}' image search queries: {queries}")
               selected = None
               candidate_pool = []
               for query_index, candidate_query in enumerate(queries, start=1):
@@ -934,6 +1058,7 @@ jobs:
               scene_manifest.append({
                   "index": scene_index,
                   "title": scene_title,
+                  "keyword": keyword,
                   "query": search_query,
                   "word_count": len(passage["text"].split()),
                   "file": filename,
@@ -987,6 +1112,30 @@ jobs:
               })
               cursor += segment_duration
 
+          if scene_timings:
+              short_scenes = [item for item in scene_timings if item["duration"] < 1.0]
+              for short_scene in short_scenes:
+                  deficit = 1.0 - short_scene["duration"]
+                  donors = sorted(
+                      [item for item in scene_timings if item is not short_scene and item["duration"] > 1.0 + deficit],
+                      key=lambda item: item["duration"],
+                      reverse=True
+                  )
+                  for donor in donors:
+                      available = donor["duration"] - 1.0
+                      transfer = min(deficit, available)
+                      donor["duration"] -= transfer
+                      short_scene["duration"] += transfer
+                      deficit -= transfer
+                      if deficit <= 0.0001:
+                          break
+              cursor = 0.0
+              for item in scene_timings:
+                  item["start"] = cursor
+                  cursor += item["duration"]
+              if any(item["duration"] < 0.999 for item in scene_timings):
+                  raise SystemExit("Visual timing failed: a keyword image beat would be under one second.")
+
           (out / "scene-timings.json").write_text(
               json.dumps(scene_timings, indent=2, ensure_ascii=False),
               encoding="utf-8"
@@ -1019,10 +1168,10 @@ jobs:
 
           script = script_path.read_text(encoding="utf-8").strip()
           words = script.split()
-          if len(words) < 500:
+          if len(words) < 900:
               raise SystemExit(
                   f"Quality check failed: narration has only {len(words)} words; "
-                  "at least 500 are required for this long-form workflow."
+                  "at least 900 are required for an investigative deep dive."
               )
 
           if len(words) > 1800:
@@ -1335,15 +1484,16 @@ jobs:
               (out / "attribution.json").read_text(encoding="utf-8")
           )
 
-          title = ("Signal Brief: " + topic).strip()
+          title_path = out / "video-title.txt"
+          title = title_path.read_text(encoding="utf-8").strip() if title_path.exists() else ("The Evidence Behind " + topic)
           if len(title) > 98:
               title = title[:95].rstrip() + "..."
           news_sources = json.loads((out / "news-sources.json").read_text(encoding="utf-8"))
 
           description_lines = [
-              "SIGNAL BRIEF | Current news, carefully explained.",
+              "SIGNAL BRIEF | Investigations, internet mysteries and the evidence behind viral claims.",
               "",
-              "A concise briefing based on recent reporting available when produced. Developing stories can change.",
+              "An evidence-led investigation based on the sources listed below. Online claims are assessed against available records and reporting; uncertainty is stated where evidence is incomplete.",
               "",
               "NEWS SOURCES",
           ]
