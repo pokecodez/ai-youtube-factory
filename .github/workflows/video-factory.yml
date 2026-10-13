@@ -19,7 +19,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y ffmpeg
-          python -m pip install --quiet requests pillow
+          python -m pip install --quiet requests pillow faster-whisper
 
       - name: Research current news, write narration and match visuals
         env:
@@ -1122,16 +1122,74 @@ jobs:
               seconds, milliseconds = divmod(milliseconds, 1000)
               return f"{hours:02}:{minutes:02}:{seconds:02},{milliseconds:03}"
 
-          groups = [words[i:i + 8] for i in range(0, len(words), 8)]
-
-          with open(out / "captions.srt", "w", encoding="utf-8") as file:
-              for index, group in enumerate(groups):
-                  start = duration * index / len(groups)
-                  end = duration * (index + 1) / len(groups)
-                  file.write(
-                      f"{index + 1}\n{stamp(start)} --> {stamp(end)}\n"
-                      + " ".join(group) + "\n\n"
+          # Align captions against the actual generated narration audio, rather than
+          # distributing script words evenly across the total duration.
+          try:
+              from faster_whisper import WhisperModel
+              print("Aligning subtitles to the actual narration audio with Whisper...")
+              whisper_model = WhisperModel("base", device="cpu", compute_type="int8")
+              segments, info = whisper_model.transcribe(
+                  str(out / "narration.wav"),
+                  word_timestamps=True,
+                  vad_filter=True,
+                  beam_size=5
+              )
+              spoken_words = []
+              for segment in segments:
+                  for word in (segment.words or []):
+                      token = word.word.strip()
+                      if token and word.end > word.start:
+                          spoken_words.append({
+                              "text": token,
+                              "start": max(0.0, float(word.start)),
+                              "end": min(duration, float(word.end))
+                          })
+              if len(spoken_words) < max(30, int(len(words) * 0.55)):
+                  raise RuntimeError(
+                      f"Whisper aligned only {len(spoken_words)} words for a {len(words)}-word script."
                   )
+
+              caption_groups = []
+              current = []
+              group_start = None
+              group_end = None
+              for spoken in spoken_words:
+                  if current and (
+                      len(current) >= 7
+                      or spoken["end"] - group_start >= 3.2
+                      or spoken["start"] - group_end >= 0.65
+                  ):
+                      caption_groups.append((group_start, group_end, " ".join(x["text"] for x in current)))
+                      current = []
+                      group_start = None
+                  if not current:
+                      group_start = spoken["start"]
+                  current.append(spoken)
+                  group_end = spoken["end"]
+              if current:
+                  caption_groups.append((group_start, group_end, " ".join(x["text"] for x in current)))
+
+              with open(out / "captions.srt", "w", encoding="utf-8") as file:
+                  for index, (start, end, caption_text) in enumerate(caption_groups, start=1):
+                      start = max(0.0, start)
+                      end = min(duration, max(start + 0.25, end))
+                      file.write(
+                          f"{index}\n{stamp(start)} --> {stamp(end)}\n"
+                          + caption_text + "\n\n"
+                      )
+              print(f"Created {len(caption_groups)} narration-aligned subtitle cues from {len(spoken_words)} recognised words.")
+          except Exception as error:
+              # A timestamped fallback remains available if Whisper/model download fails.
+              print(f"WARNING: speech alignment failed ({error}); using proportional subtitle fallback.")
+              groups = [words[i:i + 5] for i in range(0, len(words), 5)]
+              with open(out / "captions.srt", "w", encoding="utf-8") as file:
+                  for index, group in enumerate(groups):
+                      start = duration * index / len(groups)
+                      end = duration * (index + 1) / len(groups)
+                      file.write(
+                          f"{index + 1}\n{stamp(start)} --> {stamp(end)}\n"
+                          + " ".join(group) + "\n\n"
+                      )
 
           scene_total = sum(max(1, item.get("word_count", 1)) for item in scene_manifest)
           scene_timings = []
@@ -1360,7 +1418,7 @@ jobs:
                   wav.writeframesraw(buffer)
                   buffer.clear()
 
-          print(f"Generated a new ambient music track using seed {seed}.")
+          print(f"Generated an original cinematic ambient soundtrack using seed {seed}.")
           print(f"Music duration: {duration:.1f} seconds.")
           PY
 
@@ -1441,7 +1499,7 @@ jobs:
           )
           filters.append(f"[{narration_index}:a]volume=1.0[narration]")
           filters.append(
-              f"[{music_index}:a]volume=0.085,"
+              f"[{music_index}:a]volume=0.32,"
               f"afade=t=out:st={fade_start:.3f}:d=3[music]"
           )
           filters.append("[narration][music]amix=inputs=2:duration=first:dropout_transition=2[audio]")
@@ -1461,7 +1519,7 @@ jobs:
               str(out / "signal-brief.mp4")
           ])
 
-          print(f"Rendering {len(scenes)} fast-cut, narration-matched scenes with persistent SIGNAL BRIEF branding.")
+          print(f"Rendering {len(scenes)} fast-cut, narration-matched scenes with persistent SIGNAL BRIEF branding, narration-aligned subtitles, and background music.")
           subprocess.run(command, check=True)
           print("Cinematic edit completed.")
           PY
