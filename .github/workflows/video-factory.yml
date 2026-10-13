@@ -51,7 +51,8 @@ jobs:
           def gemini_post(url, **kwargs):
               kwargs["timeout"] = (20, 300)
               last_error = None
-              for attempt in range(4):
+              retry_delays = [10, 20, 40, 60, 90]
+              for attempt in range(len(retry_delays) + 1):
                   try:
                       result = requests.post(url, **kwargs)
                       if result.status_code not in (408, 429, 500, 502, 503, 504):
@@ -59,18 +60,22 @@ jobs:
                       last_error = RuntimeError(
                           f"Gemini returned HTTP {result.status_code}: {result.text[:500]}"
                       )
-                      if attempt == 3:
+                      if attempt == len(retry_delays):
                           result.raise_for_status()
                           return result
+                      retry_after = result.headers.get("Retry-After", "")
+                      try:
+                          wait_seconds = min(120, max(retry_delays[attempt], int(retry_after))) if retry_after else retry_delays[attempt]
+                      except ValueError:
+                          wait_seconds = retry_delays[attempt]
                   except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as error:
                       last_error = error
-                      if attempt == 3:
+                      if attempt == len(retry_delays):
                           raise RuntimeError(
-                              "Gemini API timed out after 4 attempts. "
-                              "Wait a few minutes and rerun the workflow."
+                              "Gemini API failed after 6 attempts. Wait a few minutes and rerun the workflow."
                           ) from error
-                  wait_seconds = 5 * (2 ** attempt)
-                  print(f"Gemini request attempt {attempt + 1} failed; retrying in {wait_seconds}s.")
+                      wait_seconds = retry_delays[attempt]
+                  print(f"Gemini request attempt {attempt + 1}/6 failed; retrying in {wait_seconds}s.")
                   time.sleep(wait_seconds)
               raise RuntimeError(f"Gemini request failed: {last_error}")
 
@@ -121,48 +126,94 @@ jobs:
                       self.in_row = False
                       self.cells = []
 
+          social_topic_signals = []
           trend_signals = []
-          trend_pages = [
-              ("vidIQ YouTube search trends", "https://vidiq.com/youtube-trending/"),
-              ("UK YouTube trending videos", "https://kworb.net/youtube/trending/uk.html"),
+
+          def add_social_signal(value, source):
+              value = html.unescape(re.sub(r"\s+", " ", value or "")).strip()
+              value = re.sub(r"\s*[-|:]\s*(Reddit|YouTube|TikTok|Instagram|X|Twitter)$", "", value, flags=re.I).strip()
+              if len(value) < 5 or len(value) > 180:
+                  return
+              if value.lower() in {"home", "popular", "trending", "top", "news", "video"}:
+                  return
+              if not any(ch.isalpha() for ch in value):
+                  return
+              if value not in social_topic_signals:
+                  social_topic_signals.append(value)
+                  print(f"Social topic signal ({source}): {value[:120]}")
+
+          social_sources = [
+              ("Google Trends UK", "https://trends.google.com/trending/rss?geo=GB"),
+              ("Google Trends US", "https://trends.google.com/trending/rss?geo=US"),
           ]
-          for trend_source, trend_url in trend_pages:
+          for source_name, source_url in social_sources:
               try:
                   trend_response = requests.get(
-                      trend_url,
+                      source_url,
                       headers={"User-Agent": "Mozilla/5.0 (compatible; SignalBrief/1.0)"},
                       timeout=18
                   )
                   trend_response.raise_for_status()
-                  trend_parser = TrendTableParser()
-                  trend_parser.feed(trend_response.text[:2000000])
-                  found_here = 0
-                  for row in trend_parser.rows:
-                      nonempty = [re.sub(r"\s+", " ", clean).strip() for clean in row if clean.strip()]
-                      if len(nonempty) < 2:
-                          continue
-                      candidate = max(nonempty[1:], key=len)
-                      if len(candidate) < 8 or len(candidate) > 180:
-                          continue
-                      if candidate.lower() in {"topic", "video", "trending topic", "title"}:
-                          continue
-                      if not any(ch.isalpha() for ch in candidate):
-                          continue
-                      if candidate not in trend_signals:
-                          trend_signals.append(candidate)
-                          found_here += 1
-                      if found_here >= 18:
-                          break
-                  print(f"Loaded {found_here} YouTube trend signals from {trend_source}.")
+                  root = ET.fromstring(trend_response.content)
+                  found = 0
+                  for entry in root.findall(".//item")[:30]:
+                      title_node = entry.find("title")
+                      if title_node is not None and title_node.text:
+                          add_social_signal(title_node.text, source_name)
+                          found += 1
+                  print(f"Loaded {found} search-trend signals from {source_name}.")
               except Exception as error:
-                  print(f"Trend source unavailable ({trend_source}): {error}")
+                  print(f"Trend source unavailable ({source_name}): {error}")
+
+          try:
+              reddit_response = requests.get(
+                  "https://www.reddit.com/r/popular/hot.json?limit=30",
+                  headers={"User-Agent": "SignalBrief/1.0 (current affairs topic research)"},
+                  timeout=18
+              )
+              reddit_response.raise_for_status()
+              reddit_posts = reddit_response.json().get("data", {}).get("children", [])
+              for post in reddit_posts:
+                  data = post.get("data", {})
+                  title = data.get("title", "")
+                  subreddit = data.get("subreddit", "")
+                  if subreddit.lower() in {"memes", "funny", "askreddit", "gaming", "music", "videos", "aww"}:
+                      continue
+                  if title:
+                      add_social_signal(title, "Reddit popular / " + subreddit)
+              print(f"Loaded social discussion signals from {len(reddit_posts)} Reddit popular posts.")
+          except Exception as error:
+              print(f"Social source unavailable (Reddit popular): {error}")
+
+          # These are topic-discovery searches, not claims that a topic is trending.
+          # Only recent reporting can make a topic eligible for the finished video.
+          topic_searches = [
+              "Epstein files social media discussion latest reporting when:7d",
+              "Jeffrey Epstein newly released documents investigation when:7d",
+              "Sean Combs Diddy case viral social media discussion latest reporting when:7d",
+              "Bohemian Grove social media discussion fact check reporting when:7d",
+              "viral controversy being discussed on X TikTok Instagram Reddit when:7d",
+              "online conspiracy claim fact check current reporting when:7d",
+              "TikTok controversy viral discussion news when:7d",
+              "Reddit viral controversy news when:7d",
+              "X Twitter trending controversy news this week when:7d",
+              "Instagram viral controversy news this week when:7d",
+          ]
+          topic_searches.extend(signal + " when:7d" for signal in social_topic_signals[:12])
 
           now = datetime.now(timezone.utc)
-          feeds = list(feeds)
-          for trend in trend_signals[:6]:
+          feeds = [
+              ("BBC World", "https://feeds.bbci.co.uk/news/world/rss.xml"),
+              ("BBC UK", "https://feeds.bbci.co.uk/news/uk/rss.xml"),
+              ("The Guardian World", "https://www.theguardian.com/world/rss"),
+              ("The Guardian Technology", "https://www.theguardian.com/technology/rss"),
+              ("NPR World", "https://feeds.npr.org/1004/rss.xml"),
+              ("Al Jazeera News", "https://www.aljazeera.com/xml/rss/all.xml"),
+          ]
+          for search_query in topic_searches[:18]:
               feeds.append((
-                  "YouTube trend research: " + trend[:70],
-                  "https://news.google.com/rss/search?q=" + quote(trend + " when:7d") + "&hl=en-GB&gl=GB&ceid=GB:en"
+                  "Social topic research: " + search_query.replace(" when:7d", "")[:85],
+                  "https://news.google.com/rss/search?q=" + quote(search_query) + "&hl=en-GB&gl=GB&ceid=GB:en"
               ))
           news_items = []
           for source_name, feed_url in feeds:
@@ -245,26 +296,22 @@ jobs:
               item["corroborating"] = corroborating
               item["story_score"] = len({other["source"] for other in corroborating})
 
-          trend_research_items = []
+          social_research_items = []
           for item in news_items:
-              if not item["source"].startswith("YouTube trend research:"):
+              if not item["source"].startswith("Social topic research:"):
                   continue
-              trend_phrase = item["source"].split(":", 1)[1]
-              trend_words = headline_tokens(trend_phrase)
-              headline_words = headline_tokens(item["headline"])
-              overlap = len(trend_words & headline_words) / max(1, len(trend_words))
-              if overlap >= 0.2:
-                  trend_research_items.append(item)
-          if trend_research_items:
+              social_research_items.append(item)
+
+          if social_research_items:
               selected_item = max(
-                  trend_research_items,
+                  social_research_items,
                   key=lambda item: (
                       item["published_dt"] >= now - timedelta(hours=24),
                       item["story_score"],
                       item["published_dt"]
                   )
               )
-              print("Prioritising a current YouTube trend with recent reporting: " + selected_item["headline"])
+              print("Prioritising a recent news story connected to social-media discussion: " + selected_item["headline"])
           else:
               selected_item = max(
                   news_items,
@@ -274,7 +321,7 @@ jobs:
                       item["published_dt"]
                   )
               )
-              print("No trend had accessible recent reporting; using the strongest current news story.")
+              print("No social-discussion topic had accessible recent reporting; using the strongest current news story.")
           related_items = [selected_item] + selected_item["corroborating"]
           related_items = sorted(related_items, key=lambda item: item["published_dt"], reverse=True)[:6]
           topic = selected_item["headline"]
@@ -343,13 +390,13 @@ jobs:
           Selected story: {topic}
           Current UTC date: {now.strftime('%Y-%m-%d')}
 
-          CURRENT YOUTUBE TREND SIGNALS (UK, for topic discovery only; not evidence of factual claims):
-          {json.dumps(trend_signals[:25], ensure_ascii=False)}
+          SOCIAL DISCUSSION SIGNALS (Google Trends and public Reddit discussions; discovery clues only, not evidence of factual claims):
+          {json.dumps(social_topic_signals[:35], ensure_ascii=False)}
 
-          SOURCE MATERIAL (headlines, summaries, publication dates and URLs from live news feeds and searches prompted by current YouTube trends):
+          SOURCE MATERIAL (recent news reports, dates, summaries, article excerpts and URLs; includes searches around high-discussion topics such as Epstein-related documents, the Diddy case, Bohemian Grove, and other current online controversies):
           {research}
 
-          Prefer a topic connected to a current YouTube trend when the supplied recent reporting genuinely supports it. If no trend has reliable recent reporting, use the strongest current story in the source material. Never claim a topic is trending or viral based only on a single trend listing, and never invent view counts or popularity statistics.
+          Choose a topic that people are actively discussing across social platforms, supported by recent reporting. Prefer high-interest public-affairs, celebrity/legal cases, internet controversies, investigations, and viral claims that have a genuine news development. Epstein-related documents, the Sean Combs/Diddy case, and Bohemian Grove are example search areas, not mandatory topics: choose them only if current evidence makes them timely. Use the social discussion signals to discover candidate topics, never as proof that a claim is true. If no social-discussion candidate has credible recent reporting, choose a well-supported current story. Never claim a topic is viral or trending unless multiple supplied signals support that wording, and never invent popularity statistics.
 
           Write 650–800 spoken words in natural British English. Aim for about 725 words, and never return fewer than 600 words. Open with the most important verified
           development and its date. Explain what happened, who is involved, why it matters now, what is
