@@ -1237,8 +1237,21 @@ jobs:
                   f"Quality check failed: {len(scenes)} scenes but {len(images)} images. "
                   "Every scene must have its own verified image."
               )
-          if any(scene.get("visual_kind") != "commons" for scene in scenes):
-              raise SystemExit("Quality check failed: a scene is missing a licensed Commons image.")
+          allowed_visual_kinds = {"commons", "original_graphic"}
+          invalid_scenes = [
+              scene.get("index", "?")
+              for scene in scenes
+              if scene.get("visual_kind") not in allowed_visual_kinds
+          ]
+          if invalid_scenes:
+              raise SystemExit(
+                  "Quality check failed: scenes have an unsupported visual type: "
+                  + ", ".join(map(str, invalid_scenes))
+              )
+          commons_count = sum(1 for scene in scenes if scene.get("visual_kind") == "commons")
+          graphic_count = sum(1 for scene in scenes if scene.get("visual_kind") == "original_graphic")
+          if commons_count + graphic_count != len(scenes):
+              raise SystemExit("Quality check failed: one or more scenes have no usable visual.")
 
           for image in images:
               if image.stat().st_size < 10000:
@@ -1253,7 +1266,8 @@ jobs:
 
           print(f"Script: {len(words)} words")
           print(f"Narration: {duration:.1f} seconds")
-          print(f"Scenes with verified licensed images: {len(images)}")
+          print(f"Scenes with verified licensed Commons images: {commons_count}")
+          print(f"Scenes with original context graphics: {graphic_count}")
           print("Pre-production quality checks passed.")
           PY
 
