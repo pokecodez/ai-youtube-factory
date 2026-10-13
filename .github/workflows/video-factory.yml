@@ -472,6 +472,10 @@ jobs:
               for item in news_sources
           )
           
+          def clean_text(value):
+              value = re.sub(r"<[^>]*>", "", str(value or ""))
+              return html.unescape(value).strip()
+
           social_discussion_items = []
           discussion_queries = [
               topic,
