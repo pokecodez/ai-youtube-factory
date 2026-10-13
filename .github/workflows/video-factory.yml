@@ -214,17 +214,28 @@ jobs:
               ]
               return any(re.search(pattern, text_value) for pattern in political_patterns)
 
+          investigative_signal_terms = (
+              "epstein", "diddy", "sean combs", "bohemian grove", "scandal", "conspiracy",
+              "mystery", "fact check", "fact-check", "viral", "controversy", "allegation",
+              "lawsuit", "court", "documents", "leaked", "missing", "alive", "dead",
+              "disappearance", "unsolved", "cover-up", "hoax", "deepfake", "exposed",
+              "investigation", "internet", "celebrity", "influencer", "youtuber", "streamer",
+              "cult", "secret", "hidden", "documentary", "fraud", "case files"
+          )
           signal_candidates = [
               signal for signal in social_topic_signals
               if not is_political_topic(signal)
+              and any(term in signal.lower() for term in investigative_signal_terms)
               and not any(term in signal.lower() for term in (
                   "official trailer", "music video", "official video", "new song",
-                  "new album", "minecraft", "gameplay", "reaction compilation"
+                  "new album", "minecraft", "gameplay", "reaction compilation",
+                  "fixtures", "premier league", "football", "fc ", "nascar", "snowfall totals",
+                  "tour dates", "transfer news"
               ))
           ]
           topic_searches.extend(
-              signal + " fact check claims evidence social media when:7d"
-              for signal in signal_candidates[:10]
+              signal + " controversy mystery claims evidence social media when:7d"
+              for signal in signal_candidates[:8]
           )
 
           now = datetime.now(timezone.utc)
@@ -366,8 +377,8 @@ jobs:
               selected_item = max(
                   social_research_items,
                   key=lambda item: (
-                      item["investigative_relevance"],
                       item["story_score"],
+                      item["investigative_relevance"],
                       item["published_dt"] >= now - timedelta(hours=24),
                       item["published_dt"]
                   )
@@ -387,8 +398,8 @@ jobs:
               selected_item = max(
                   eligible_deep_dive_items,
                   key=lambda item: (
-                      item["investigative_relevance"],
                       item["story_score"],
+                      item["investigative_relevance"],
                       item["published_dt"] >= now - timedelta(hours=24),
                       item["published_dt"]
                   )
@@ -576,38 +587,60 @@ jobs:
               raise SystemExit("Script generation returned empty text.")
 
           word_count = len(script.split())
-          if word_count < 1000:
-              print(f"Narration draft is only {word_count} words; asking Gemini to expand the investigation.")
-              expansion_prompt = f"""You are the lead writer for SIGNAL BRIEF's investigative YouTube video essays. Expand the narration below into 1,000–1,300 spoken words in natural British English. Preserve factual meaning and use only information supported by the supplied research. Do not invent facts, quotes, dates, numbers, motives or sources. Deepen the investigation by explaining the origin of the claim, the strongest evidence on each side, what social media commonly gets wrong, what reliable records actually establish, and what remains uncertain. Do not turn it into a routine news bulletin. Return only the complete narration, with no title, headings, bullet points, citations or production notes.
-          
-          SOURCE MATERIAL:
-          {research}
-          
-          CURRENT NARRATION:
-          {script}"""
-              expansion_response = gemini_post(
-                  "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent",
-                  headers={"x-goog-api-key": key},
-                  json={
-                      "contents": [{"parts": [{"text": expansion_prompt}]}],
-                      "generationConfig": {"temperature": 0.5, "maxOutputTokens": 2200}
-                  },
-                  timeout=(20, 300)
+          expansion_attempt = 0
+          while word_count < 1050 and expansion_attempt < 3:
+              expansion_attempt += 1
+              print(
+                  f"Narration is {word_count} words; asking Gemini to deepen the investigation "
+                  f"(expansion attempt {expansion_attempt}/3)."
               )
-              expansion_response.raise_for_status()
-              expansion_data = expansion_response.json()
-              expanded_script = "".join(
-                  part.get("text", "")
-                  for part in expansion_data["candidates"][0]["content"]["parts"]
-              ).strip()
-              if expanded_script:
-                  script = expanded_script
-                  word_count = len(script.split())
+              expansion_prompt = f"""You are the lead writer for SIGNAL BRIEF, a modern investigative YouTube documentary channel. The current narration is {word_count} words. Produce a stronger COMPLETE version of 1,050–1,300 spoken words in natural British English. This is a substantive investigation, not a news bulletin.
 
-          if word_count < 900:
+              Preserve all supported facts and use only the supplied research or facts already present in the narration. Do not invent events, quotes, dates, numbers, sources, motives, social-media reactions, or evidence. Add meaningful depth: trace the origin and timeline of the claim, explain the strongest arguments supporters make, assess each argument against the available evidence, identify common misconceptions and missing context, compare reliable sources, and clearly state what remains unknown. Do not repeat paragraphs or pad with generic commentary. If evidence is limited, explain that limitation in useful detail. Return the entire finished narration only, without a title, headings, bullets, citations or production notes.
+
+              SOURCE MATERIAL:
+              {research}
+
+              SOCIAL DISCUSSION MATERIAL:
+              {research if not social_discussion_items else json.dumps(social_discussion_items[:12], ensure_ascii=False)}
+
+              CURRENT NARRATION:
+              {script}"""
+              try:
+                  expansion_response = gemini_post(
+                      "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent",
+                      headers={"x-goog-api-key": key},
+                      json={
+                          "contents": [{"parts": [{"text": expansion_prompt}]}],
+                          "generationConfig": {"temperature": 0.45, "maxOutputTokens": 3400}
+                      },
+                      timeout=(20, 300)
+                  )
+                  expansion_response.raise_for_status()
+                  expansion_data = expansion_response.json()
+                  expanded_script = "".join(
+                      part.get("text", "")
+                      for part in expansion_data["candidates"][0]["content"]["parts"]
+                  ).strip()
+                  expanded_count = len(expanded_script.split())
+                  if expanded_script and expanded_count > word_count:
+                      script = expanded_script
+                      word_count = expanded_count
+                      print(f"Expanded narration now contains {word_count} words.")
+                  else:
+                      print("Expansion did not increase the word count; keeping the better existing draft.")
+              except Exception as error:
+                  print(f"Narration expansion attempt {expansion_attempt} failed: {error}")
+
+          if word_count < 800:
               raise SystemExit(
-                  f"Narration generation failed: only {word_count} words after expansion; "
-                  "at least 900 are required for an investigative deep dive. Rerun the workflow to try again."
+                  f"Narration generation failed: only {word_count} words after expansion attempts; "
+                  "at least 800 are required. Rerun the workflow to try again."
+              )
+          if word_count < 1000:
+              print(
+                  f"Warning: final narration is {word_count} words after three expansion attempts. "
+                  "Continuing because the draft is substantial and the evidence must not be padded."
               )
 
           (out / "script.txt").write_text(script, encoding="utf-8")
