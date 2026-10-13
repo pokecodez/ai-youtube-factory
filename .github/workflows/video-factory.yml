@@ -1,4 +1,4 @@
-name: AI YouTube Factory - Build Video
+name: Signal Brief - Current News Video
 
 on:
   workflow_dispatch:
@@ -21,7 +21,7 @@ jobs:
           sudo apt-get install -y ffmpeg
           python -m pip install --quiet requests pillow
 
-      - name: Generate script, narration and images
+      - name: Research current news, write narration and match visuals
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
@@ -74,50 +74,194 @@ jobs:
                   time.sleep(wait_seconds)
               raise RuntimeError(f"Gemini request failed: {last_error}")
 
-          topics = [
-              "the Mary Celeste and the evidence behind its abandonment",
-              "the disappearance of the Roanoke colony and competing explanations",
-              "the Voynich manuscript and what researchers can actually establish",
-              "the Antikythera mechanism and what it reveals about ancient technology",
-              "the lost Franklin expedition and the evidence recovered afterward",
-              "the Nazca Lines and the leading explanations for their purpose",
-              "the disappearance of the Princes in the Tower and the limits of the evidence",
-              "the eruption of Vesuvius and the clues preserved at Pompeii",
-              "the mystery of the Phaistos Disc and why its writing remains undeciphered",
-              "the real history and evidence surrounding the Green Children of Woolpit",
-              "the fate of the Donner Party, focusing on documented decisions and evidence",
-              "the collapse of the Bronze Age societies and the evidence for multiple causes"
+          feeds = [
+              ("BBC World", "https://feeds.bbci.co.uk/news/world/rss.xml"),
+              ("BBC UK", "https://feeds.bbci.co.uk/news/uk/rss.xml"),
+              ("The Guardian World", "https://www.theguardian.com/world/rss"),
+              ("The Guardian Technology", "https://www.theguardian.com/technology/rss"),
+              ("NPR World", "https://feeds.npr.org/1004/rss.xml"),
+              ("Al Jazeera News", "https://www.aljazeera.com/xml/rss/all.xml"),
           ]
-          topic = random.choice(topics)
+          from datetime import datetime, timezone, timedelta
+          from email.utils import parsedate_to_datetime
+          import xml.etree.ElementTree as ET
+          from html.parser import HTMLParser
+
+          now = datetime.now(timezone.utc)
+          news_items = []
+          for source_name, feed_url in feeds:
+              try:
+                  feed_response = requests.get(
+                      feed_url,
+                      headers={"User-Agent": "SignalBrief/1.0 (current affairs research)"},
+                      timeout=20
+                  )
+                  feed_response.raise_for_status()
+                  root = ET.fromstring(feed_response.content)
+                  entries = root.findall(".//item")
+                  if not entries:
+                      entries = [node for node in root.iter() if node.tag.endswith("entry")]
+                  for entry in entries:
+                      def node_text(names):
+                          for node in entry.iter():
+                              if node.tag.split("}")[-1].lower() in names and node.text:
+                                  return node.text.strip()
+                          return ""
+                      headline = node_text({"title"})
+                      summary = node_text({"description", "summary", "encoded"})
+                      link = ""
+                      for node in entry.iter():
+                          if node.tag.split("}")[-1].lower() == "link":
+                              link = (node.attrib.get("href") or node.text or "").strip()
+                              if link:
+                                  break
+                      published = node_text({"pubdate", "published", "updated", "date"})
+                      try:
+                          published_at = parsedate_to_datetime(published)
+                          if published_at.tzinfo is None:
+                              published_at = published_at.replace(tzinfo=timezone.utc)
+                          published_at = published_at.astimezone(timezone.utc)
+                      except Exception:
+                          try:
+                              published_at = datetime.fromisoformat(published.replace("Z", "+00:00"))
+                              if published_at.tzinfo is None:
+                                  published_at = published_at.replace(tzinfo=timezone.utc)
+                              published_at = published_at.astimezone(timezone.utc)
+                          except Exception:
+                              published_at = now - timedelta(hours=12)
+                      summary = re.sub(r"<[^>]+>", " ", summary)
+                      summary = html.unescape(re.sub(r"\s+", " ", summary)).strip()
+                      if headline and link.startswith("http") and published_at >= now - timedelta(hours=72):
+                          news_items.append({
+                              "source": source_name,
+                              "headline": headline,
+                              "summary": summary[:900],
+                              "url": link,
+                              "published": published_at.isoformat(),
+                              "published_dt": published_at,
+                          })
+                  print(f"Loaded current headlines from {source_name}.")
+              except Exception as error:
+                  print(f"News feed unavailable ({source_name}): {error}")
+
+          unique_items = {}
+          for item in news_items:
+              key_title = re.sub(r"[^a-z0-9 ]", "", item["headline"].lower())
+              unique_items[(item["source"], key_title)] = item
+          news_items = sorted(unique_items.values(), key=lambda item: item["published_dt"], reverse=True)
+          if not news_items:
+              raise SystemExit("No current news feeds were available. Rerun the workflow later.")
+
+          def headline_tokens(value):
+              ignored = {"the", "and", "for", "with", "from", "that", "this", "says", "after", "over", "into", "amid", "what", "why", "how", "its", "their", "has", "have", "are", "was", "were"}
+              return {word for word in re.findall(r"[a-z0-9]+", value.lower()) if len(word) > 2 and word not in ignored}
+
+          for item in news_items:
+              own = headline_tokens(item["headline"])
+              corroborating = []
+              for other in news_items:
+                  if other is item or other["source"] == item["source"]:
+                      continue
+                  other_tokens = headline_tokens(other["headline"])
+                  overlap = len(own & other_tokens) / max(1, len(own | other_tokens))
+                  if overlap >= 0.22:
+                      corroborating.append(other)
+              item["corroborating"] = corroborating
+              item["story_score"] = len({other["source"] for other in corroborating})
+
+          selected_item = max(
+              news_items,
+              key=lambda item: (item["published_dt"] >= now - timedelta(hours=24), item["story_score"], item["published_dt"])
+          )
+          related_items = [selected_item] + selected_item["corroborating"]
+          related_items = sorted(related_items, key=lambda item: item["published_dt"], reverse=True)[:6]
+          topic = selected_item["headline"]
+
+          class ArticleParser(HTMLParser):
+              def __init__(self):
+                  super().__init__(convert_charrefs=True)
+                  self.in_paragraph = False
+                  self.paragraph_parts = []
+                  self.paragraphs = []
+                  self.meta_description = ""
+              def handle_starttag(self, tag, attrs):
+                  attributes = dict(attrs)
+                  if tag.lower() == "p":
+                      self.in_paragraph = True
+                      self.paragraph_parts = []
+                  if tag.lower() == "meta":
+                      name = (attributes.get("name") or attributes.get("property") or "").lower()
+                      if name in ("description", "og:description", "twitter:description") and not self.meta_description:
+                          self.meta_description = attributes.get("content", "")
+              def handle_data(self, data):
+                  if self.in_paragraph:
+                      value = data.strip()
+                      if value:
+                          self.paragraph_parts.append(value)
+              def handle_endtag(self, tag):
+                  if tag.lower() == "p" and self.in_paragraph:
+                      paragraph = " ".join(self.paragraph_parts).strip()
+                      if len(paragraph) > 35:
+                          self.paragraphs.append(paragraph)
+                      self.in_paragraph = False
+                      self.paragraph_parts = []
+
+          news_sources = []
+          for item in related_items:
+              article_text = ""
+              try:
+                  article_response = requests.get(
+                      item["url"],
+                      headers={"User-Agent": "SignalBrief/1.0 (current-affairs research)"},
+                      timeout=18
+                  )
+                  article_response.raise_for_status()
+                  parser = ArticleParser()
+                  parser.feed(article_response.text[:1500000])
+                  article_text = " ".join(parser.paragraphs)
+                  if len(article_text) < 250:
+                      article_text = parser.meta_description
+              except Exception as error:
+                  print(f"Could not retrieve full article from {item['source']}; using its RSS summary: {error}")
+              if not article_text:
+                  article_text = item["summary"]
+              article_text = re.sub(r"\s+", " ", html.unescape(article_text)).strip()[:2600]
+              news_sources.append({key: item[key] for key in ("source", "headline", "summary", "url", "published")})
+              news_sources[-1]["article_excerpt"] = article_text
+
           (out / "topic.txt").write_text(topic, encoding="utf-8")
+          (out / "news-sources.json").write_text(json.dumps(news_sources, indent=2, ensure_ascii=False), encoding="utf-8")
+          research = "\n\n".join(
+              f"SOURCE: {item['source']}\nPUBLISHED: {item['published']}\nHEADLINE: {item['headline']}\nRSS SUMMARY: {item['summary']}\nARTICLE EXCERPT (when accessible): {item['article_excerpt']}\nURL: {item['url']}"
+              for item in news_sources
+          )
 
-          prompt = f"""Write an original, engaging long-form YouTube documentary narration about:
-          {topic}
+          prompt = f"""You are the research writer for SIGNAL BRIEF, a current-affairs YouTube channel.
+          Create a clear, compelling, accurate news explainer based on the recent source material below.
+          Selected story: {topic}
+          Current UTC date: {now.strftime('%Y-%m-%d')}
 
-          Target roughly 1,000–1,300 spoken words, with a strong opening mystery or surprising
-          documented fact in the first two sentences. Do not begin with greetings, channel
-          introductions, or generic phrases such as 'throughout history'.
+          SOURCE MATERIAL (headlines, summaries, publication dates and URLs from live news feeds):
+          {research}
 
-          Structure the narration as a story:
-          - Open with a specific question, scene, or contradiction that creates curiosity.
-          - Establish the real people, place, and historical context clearly.
-          - Reveal evidence in a logical sequence, adding meaningful new information as the
-            story progresses.
-          - Explain the strongest competing interpretations fairly and distinguish confirmed
-            facts from disputed claims and speculation.
-          - Include a few natural curiosity gaps, but resolve them honestly rather than
-            withholding basic information or making misleading promises.
-          - End with a satisfying conclusion explaining what is known, what remains uncertain,
-            and why the mystery matters.
+          Write 500–650 spoken words in natural British English. Open with the most important verified
+          development and its date. Explain what happened, who is involved, why it matters now, what is
+          confirmed, what remains uncertain, and what to watch next. Make the story understandable to a
+          viewer who has not followed it before.
 
-          Quality rules:
-          - Be fact-conscious. Never invent quotations, scenes, dates, sources, or evidence.
-          - Do not present myths or internet rumours as established facts.
-          - Avoid repetitive wording, filler, exaggerated clickbait, and repeated summaries.
-          - Make this narration distinctive, specific to this topic, and suitable for spoken
-            delivery in clear, natural British English.
-          - Return only the spoken narration. Do not include a title, headings, bullet points,
-            citations, stage directions, or notes to the editor."""
+          Research and accuracy rules:
+          - Use only claims supported by the source material or uncontroversial background context.
+          - Attribute allegations, official statements and disputed claims to the source or named speaker.
+          - Do not invent quotes, numbers, dates, eyewitness details, motives, or future outcomes.
+          - If only one source covers a claim, explicitly frame it as that outlet's reporting rather than
+            independently confirmed fact. Do not claim independent corroboration unless the supplied
+            sources genuinely support the same event.
+          - If source summaries disagree or details are missing, state that clearly instead of guessing.
+          - Avoid sensationalism, partisan advocacy, graphic detail, and presenting speculation as fact.
+          - Do not use generic filler or a long channel introduction. End with the key implication and
+            the next development viewers should monitor, without pretending to predict the future.
+          - Return only spoken narration. No title, headings, bullet points, citations, stage directions,
+            or production notes."""
 
           response = gemini_post(
               "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent",
@@ -126,7 +270,7 @@ jobs:
                   "contents": [{"parts": [{"text": prompt}]}],
                   "generationConfig": {
                       "temperature": 0.7,
-                      "maxOutputTokens": 2400
+                      "maxOutputTokens": 1800
                   }
               },
               timeout=(20, 300)
@@ -199,23 +343,24 @@ jobs:
           print("Narration generated.")
 
 
-          visual_prompt = f"""You are preparing visual references for a factual historical documentary.
-          The narration is divided into numbered passages below. Return ONLY valid JSON:
-          {{"scenes":[{{"index":1,"title":"short visual label","query":"specific Wikimedia Commons search phrase"}}]}}
-          Create exactly one scene for every passage, preserving the passage order.
-          Queries must be grounded in names, locations, historical sites, documents, artefacts,
-          architecture, landscapes, or other clearly documented non-weapon subjects mentioned
-          in that passage. Prefer precise named entities over generic mood words. Never invent
-          an object or event. Do not search for weapons or ordnance; if a passage mentions them,
-          choose the surrounding location, people, records, or historical context instead.
-          Keep each query to 3–7 useful words. Avoid generic searches like "history", "mystery",
-          "dark", "old building", or "historical photo".
+          visual_prompt = f"""You are the visual researcher for SIGNAL BRIEF, a current-affairs news video.
+          The narration is divided into very short sequential passages. Return ONLY valid JSON:
+          {{"scenes":[{{"index":1,"title":"specific visual subject","query":"specific Wikimedia Commons search phrase"}}]}}
+          Create exactly one scene for every passage, preserving every index and the order.
+          Each image must directly illustrate the exact words in that passage, not merely the general story.
+          Use named people, places, buildings, maps, transport, public events, relevant documents, landscapes,
+          company logos or other factual context only when supported by the current story and source material.
+          Never invent a photo or imply a stock image depicts the actual event if it does not. For a passage
+          with no concrete visual noun, use a relevant location, organisation, person or factual context from
+          the supplied current story. Do not search for weapons or ordnance; use the surrounding location,
+          people, records or context instead. Queries should be specific, 3–7 words, and searchable on
+          Wikimedia Commons. Avoid generic mood words. Current story: {topic}
 
           PASSAGES:
           """
           script_words = script.split()
-          scene_count = 12
-          chunk_size = max(1, (len(script_words) + scene_count - 1) // scene_count)
+          chunk_size = 7
+          scene_count = (len(script_words) + chunk_size - 1) // chunk_size
           passages = []
           for index in range(scene_count):
               passage_words = script_words[index * chunk_size:(index + 1) * chunk_size]
@@ -233,7 +378,7 @@ jobs:
                   "contents": [{"parts": [{"text": visual_input}]}],
                   "generationConfig": {
                       "temperature": 0.2,
-                      "maxOutputTokens": 1800,
+                      "maxOutputTokens": 7000,
                       "responseMimeType": "application/json"
                   }
               },
@@ -286,7 +431,7 @@ jobs:
               except OSError:
                   heading_font = ImageFont.load_default()
                   body_font = ImageFont.load_default()
-              draw.text((180, 205), "HISTORICAL CONTEXT", font=body_font, fill=(155, 177, 201))
+              draw.text((180, 205), "CURRENT NEWS CONTEXT", font=body_font, fill=(155, 177, 201))
               title_lines = []
               current = ""
               for word in (title or "Documentary context").split():
@@ -323,7 +468,7 @@ jobs:
               response = requests.get(
                   "https://commons.wikimedia.org/w/api.php",
                   params=params,
-                  headers={"User-Agent": "AIYouTubeFactory/1.0 (documentary production)"},
+                  headers={"User-Agent": "SignalBrief/1.0 (news video with source attribution)"},
                   timeout=45
               )
               response.raise_for_status()
@@ -366,7 +511,7 @@ jobs:
                       "creator": clean_text(metadata.get("Artist", {}).get("value", "")),
                       "license": license_name,
                       "license_url": clean_text(metadata.get("LicenseUrl", {}).get("value", "")),
-                      "foreign_landing_url": info.get("descriptionurl", ""),
+                      "foreign_landing_url": f"https://commons.wikimedia.org/?curid={page.get('pageid', '')}",
                       "attribution": clean_text(
                           metadata.get("Attribution", {}).get("value", "")
                           or metadata.get("Credit", {}).get("value", "")
@@ -396,7 +541,7 @@ jobs:
                       try:
                           request = urllib.request.Request(
                               candidate["url"],
-                              headers={"User-Agent": "AIYouTubeFactory/1.0"}
+                              headers={"User-Agent": "SignalBrief/1.0"}
                           )
                           with urllib.request.urlopen(request, timeout=30) as image_response:
                               content_type = image_response.headers.get(
@@ -437,7 +582,7 @@ jobs:
                   attribution.append({
                       "file": filename,
                       "title": scene_title + " — generated context card",
-                      "creator": "AI YouTube Factory",
+                      "creator": "Signal Brief",
                       "attribution": "Generated contextual graphic; no external image used",
                       "license": "Generated graphic",
                       "license_url": "",
@@ -745,7 +890,14 @@ jobs:
           fade_start = max(0.0, duration - 3.0)
           filters.append(
               f"[{current_video}]"
-              "subtitles=output/captions.srt:"
+              "drawbox=x=0:y=0:w=iw:h=96:color=black@0.62:t=fill,"
+              "drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:"
+              "text='SIGNAL BRIEF':fontcolor=white:fontsize=36:x=64:y=27:"
+              "borderw=1:bordercolor=black@0.7"
+              "[branded]"
+          )
+          filters.append(
+              "[branded]subtitles=output/captions.srt:"
               "force_style='FontName=Arial,FontSize=22,Outline=2,Shadow=1,Alignment=2,MarginV=55'"
               "[video]"
           )
@@ -768,10 +920,10 @@ jobs:
               "-b:a", "160k",
               "-t", f"{duration:.3f}",
               "-movflags", "+faststart",
-              str(out / "mystery-documentary.mp4")
+              str(out / "signal-brief.mp4")
           ])
 
-          print(f"Rendering {len(scenes)} narration-matched scenes with slow pan/zoom and crossfades.")
+          print(f"Rendering {len(scenes)} fast-cut, narration-matched scenes with persistent SIGNAL BRIEF branding.")
           subprocess.run(command, check=True)
           print("Cinematic edit completed.")
           PY
@@ -780,7 +932,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          video="output/mystery-documentary.mp4"
+          video="output/signal-brief.mp4"
 
           if [ ! -s "$video" ]; then
             echo "Quality check failed: final MP4 is missing or empty."
@@ -836,45 +988,61 @@ jobs:
 
           out = Path("output")
           topic = (out / "topic.txt").read_text(encoding="utf-8").strip()
-          video_path = out / "mystery-documentary.mp4"
+          video_path = out / "signal-brief.mp4"
           attributions = json.loads(
               (out / "attribution.json").read_text(encoding="utf-8")
           )
 
-          title = ("The Mystery of " + topic).strip()
-          if len(title) > 95:
-              title = title[:92].rstrip() + "..."
+          title = ("Signal Brief: " + topic).strip()
+          if len(title) > 98:
+              title = title[:95].rstrip() + "..."
+          news_sources = json.loads((out / "news-sources.json").read_text(encoding="utf-8"))
 
           description_lines = [
-              "A historical documentary exploring the evidence, leading theories, "
-              "and unanswered questions surrounding " + topic + ".",
+              "SIGNAL BRIEF | Current news, carefully explained.",
               "",
-              "This episode distinguishes documented evidence from disputed claims "
-              "and speculation.",
+              "A concise briefing based on recent reporting available when produced. Developing stories can change.",
               "",
-              "IMAGE CREDITS AND LICENCES",
+              "NEWS SOURCES",
           ]
-
-          for item in attributions:
-              title_text = item.get("title", "Wikimedia Commons image")
-              creator = item.get("creator") or item.get("attribution") or "Creator not listed"
-              license_name = item.get("license") or "Licence listed on source page"
-              source_url = item.get("foreign_landing_url") or ""
-              license_url = item.get("license_url") or ""
-              credit = f"- {title_text} — {creator}; {license_name}"
-              if source_url:
-                  credit += f"; source: {source_url}"
-              if license_url:
-                  credit += f"; licence: {license_url}"
-              description_lines.append(credit)
-
+          for item in news_sources[:4]:
+              description_lines.append(
+                  f"- {item['source']} ({item['published'][:10]}): {item['url']}"
+              )
           description_lines += [
               "",
-              "Narration and background music were generated for this video. "
-              "The historical content should be checked against reliable sources; "
-              "this video is intended for education and entertainment.",
+              "IMAGE CREDITS AND LICENCES",
+              "Each linked Wikimedia Commons file page identifies the image title, creator and licence terms.",
           ]
-          description = "\n".join(description_lines)[:4900]
+          licence_groups = {}
+          generated_count = 0
+          for item in attributions:
+              licence_name = item.get("license") or "Licence listed on source page"
+              source_url = item.get("foreign_landing_url") or ""
+              if source_url:
+                  licence_groups.setdefault(licence_name, []).append(source_url)
+              elif licence_name == "Generated graphic":
+                  generated_count += 1
+          for licence_name, source_urls in sorted(licence_groups.items()):
+              description_lines.append(licence_name + ": " + " ".join(source_urls))
+          if generated_count:
+              description_lines.append(
+                  f"Generated context cards: {generated_count}; created by Signal Brief for this video."
+              )
+          description_lines += [
+              "",
+              "Narration and original background music were generated for this video. Illustrative images "
+              "should not be assumed to depict the exact moment described unless their source confirms it.",
+              "",
+              "Channel: Signal Brief",
+          ]
+          description = "\n".join(description_lines)
+          if len(description) > 4900:
+              raise SystemExit(
+                  f"Description needs {len(description)} characters, exceeding YouTube's limit after "
+                  "including source and image licence credits. Reduce the number of source images rather "
+                  "than silently omitting required attribution."
+              )
 
           credentials = Credentials(
               token=None,
@@ -931,7 +1099,7 @@ jobs:
       - name: Upload finished video and source files
         uses: actions/upload-artifact@v4
         with:
-          name: mystery-documentary-video
+          name: signal-brief-video
           path: output/
           if-no-files-found: error
           retention-days: 7
