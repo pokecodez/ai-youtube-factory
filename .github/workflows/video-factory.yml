@@ -552,7 +552,12 @@ jobs:
               ignored = {
                   "the", "and", "for", "with", "from", "that", "this", "into",
                   "near", "about", "during", "after", "before", "image", "photo",
-                  "historic", "historical", "documentary", "scene", "view"
+                  "historic", "historical", "documentary", "scene", "view",
+                  "official", "trailer", "video", "videos", "news", "current",
+                  "report", "reports", "reporting", "unveils", "announces",
+                  "reveals", "firstshowing", "first", "latest", "new", "newly",
+                  "around", "across", "actually", "known", "story", "stories",
+                  "audiences", "people", "content", "channel", "channels"
               }
               return {
                   word for word in re.findall(r"[a-z0-9]+", value.lower())
@@ -713,17 +718,30 @@ jobs:
           scene_manifest = []
           used_titles = set()
 
+          def tokens_ignored():
+              return {
+                  "the", "and", "for", "with", "from", "that", "this", "into",
+                  "near", "about", "during", "after", "before", "image", "photo",
+                  "historic", "historical", "documentary", "scene", "view", "official",
+                  "trailer", "video", "videos", "news", "current", "report", "reports",
+                  "reporting", "unveils", "announces", "reveals", "firstshowing", "first",
+                  "latest", "new", "newly", "around", "across", "actually", "known",
+                  "story", "stories", "audiences", "people", "content", "channel", "channels"
+              }
+
           def scene_search_queries(search_query, scene_title, passage_text):
               passage_terms = sorted(tokens(passage_text))
               topic_terms = sorted(tokens(topic))
               passage_ordered = re.findall(r"[a-z0-9]+", passage_text.lower())
               topic_ordered = re.findall(r"[a-z0-9]+", topic.lower())
+              meaningful_passage = [word for word in passage_ordered if word not in tokens_ignored()]
+              meaningful_topic = [word for word in topic_ordered if word not in tokens_ignored()]
               variants = [
                   search_query,
                   scene_title,
-                  " ".join(passage_ordered[:5]),
-                  " ".join(topic_ordered[:4]),
-                  " ".join((topic_ordered + passage_ordered)[:6]),
+                  " ".join(meaningful_passage[:5]),
+                  " ".join(meaningful_topic[:5]),
+                  " ".join((meaningful_topic[:3] + meaningful_passage[:3])),
               ]
               result = []
               for value in variants:
@@ -796,14 +814,41 @@ jobs:
                       time.sleep(1)
 
               if not selected:
-                  raise SystemExit(
-                      f"No suitable licensed image found for scene {scene_index} after "
-                      f"{len(queries)} search queries and retries. The video will not be rendered "
-                      "or uploaded with a blank/text-card scene. Rerun the workflow to retry." 
-                  )
+                  if attribution:
+                      previous = attribution[-1]
+                      filename = f"image-{scene_index}.jpg"
+                      previous_file = images / previous["file"]
+                      fallback_file = images / filename
+                      fallback_file.write_bytes(previous_file.read_bytes())
+                      selected = dict(previous)
+                      selected["file"] = filename
+                      selected["scene"] = scene_index
+                      selected["search_query"] = "Fallback: reuse previous verified story image after Commons rate limit"
+                      selected["reused_fallback"] = True
+                      print(
+                          f"WARNING: no new licensed image found for scene {scene_index}; "
+                          f"reusing verified story image '{previous.get('title', 'previous image')}' "
+                          "instead of failing the entire video."
+                      )
+                  else:
+                      fallback_title = scene_title or topic or "Current news context"
+                      filename = f"image-{scene_index}.jpg"
+                      make_context_card(images / filename, fallback_title, passage["text"])
+                      selected = {
+                          "url": "", "title": fallback_title,
+                          "creator": "Signal Brief", "license": "Original graphic",
+                          "license_url": "", "foreign_landing_url": "",
+                          "attribution": "Original graphic created by Signal Brief",
+                          "match_score": 0, "file": filename, "scene": scene_index,
+                          "search_query": "Original context graphic fallback", "reused_fallback": True
+                      }
+                      print(
+                          f"WARNING: no licensed image was available for the first scene; "
+                          "using a branded context graphic so the workflow can continue."
+                      )
 
               attribution.append(selected)
-              visual_kind = "commons"
+              visual_kind = "commons" if selected.get("license") != "Original graphic" else "original_graphic"
 
               scene_manifest.append({
                   "index": scene_index,
