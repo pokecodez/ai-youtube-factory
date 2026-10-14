@@ -38,6 +38,10 @@ jobs:
       - name: Research current news, write narration and match visuals
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
+          PIXABAY_API_KEY: ${{ secrets.PIXABAY_API_KEY }}
+          ENABLE_AI_IMAGES: "false"  # Change to "true" after enabling paid Gemini image generation.
+          MAX_AI_IMAGES_PER_VIDEO: "18"
         run: |
           set -euo pipefail
 
@@ -58,6 +62,10 @@ jobs:
           from PIL import Image
           
           key = os.environ["GEMINI_API_KEY"]
+          pexels_key = os.environ.get("PEXELS_API_KEY", "").strip()
+          pixabay_key = os.environ.get("PIXABAY_API_KEY", "").strip()
+          enable_ai_images = os.environ.get("ENABLE_AI_IMAGES", "false").lower() == "true"
+          max_ai_images = max(0, min(24, int(os.environ.get("MAX_AI_IMAGES_PER_VIDEO", "18"))))
           out = Path("output")
           images = out / "images"
           images.mkdir(parents=True, exist_ok=True)
@@ -787,11 +795,11 @@ jobs:
           
           visual_prompt = f"""You are the visual researcher and editor for a modern, high-quality investigative YouTube documentary for SIGNAL BRIEF.
           Return ONLY valid JSON:
-          {{"scenes":[{{"index":1,"keyword":"specific subject, not an isolated verb","title":"what the viewer should actually see","visual_subject":"concrete visual subject in plain language","visual_intent":"why this visual fits this exact narration passage","query":"specific Wikimedia Commons search phrase","avoid":"misleading or unrelated visual types"}}]}}
+          {{"scenes":[{{"index":1,"keyword":"specific subject, not an isolated verb","title":"what the viewer should actually see","visual_subject":"concrete visual subject in plain language","visual_intent":"why this visual fits this exact narration passage","query":"specific photographic search phrase","avoid":"misleading or unrelated visual types"}}]}}
           Create exactly one visual beat for every narration passage, preserving all indices and order. Read the ENTIRE investigation topic and each passage together before deciding what the image should depict. Understand references, pronouns, irony, metaphors, allegations, and the sentence's actual subject. Never match an image to a single word in isolation.
           The visual must represent the central SUBJECT or EVIDENCE being discussed in that exact passage. Example: if the investigation discusses a conspiracy theory about a reptilian race allegedly seeking to destroy the world, the word “destroy” does NOT mean search for a burning building. Choose a clearly illustrative reptilian-humanoid/conspiracy-culture visual, the person or source making the claim, or the specific document/post being discussed. Never present a fictional or alleged event as proven fact.
           Identify the passage's role (claim, person, location, document, timeline, evidence, counterargument, or conclusion), then choose the most informative visual for that role. Prefer directly relevant people, named places, real documents, screenshots or public records when available. Use illustrations only when suitable to explain a theory or abstract idea. Do not use generic disaster, fire, courtroom, city, or “mysterious” stock images just because a verb or mood suggests them. Never imply a generic image depicts the actual event.
-          The keyword, visual_subject, and query must describe the SAME thing. The query must be a short, FINDABLE Wikimedia Commons search phrase (usually 2–5 words), not a description of a hypothetical website screen or made-up screenshot. Prefer subjects that really have reusable photos: U.S. military training, journalists working, an ordinary smartphone, a television newsroom, computer image editing, computer displays, archive files, and genuine named people or places. Do NOT search for the exact viral fake image as if it were verified evidence. A REAL, clearly illustrative shot of the investigation's subject is better than an impossible "computer showing the precise article" request. For abstract passages, reuse a recurring visual theme (reporting, phones, investigations) rather than inventing a specific document or interface. Make sure visual subjects vary across the film. Image beats must be at least 1.0 second apart; timings are based on narration audio. Current investigation: {topic}
+          The keyword, visual_subject, and query must describe the SAME thing. The query must be a short, FINDABLE image-search phrase (usually 2–5 words), not a description of a hypothetical website screen or made-up screenshot. Prefer subjects that really have reusable photos: U.S. military training, journalists working, an ordinary smartphone, a television newsroom, computer image editing, computer displays, archive files, and genuine named people or places. Do NOT search for the exact viral fake image as if it were verified evidence. A REAL, clearly illustrative shot of the investigation's subject is better than an impossible "computer showing the precise article" request. For abstract passages, reuse a recurring visual theme (reporting, phones, investigations) rather than inventing a specific document or interface. Make sure visual subjects vary across the film. Image beats must be at least 1.0 second apart; timings are based on narration audio. Current investigation: {topic}
           
           PASSAGES:
           """
@@ -898,7 +906,7 @@ jobs:
           commons_last_request = 0.0
           commons_search_cache = {}
           
-          def image_candidates(search_query):
+          def commons_image_candidates(search_query):
               global commons_last_request
               cache_key = search_query.casefold().strip()
               if cache_key in commons_search_cache:
@@ -980,6 +988,8 @@ jobs:
                   license_lower = license_name.lower()
                   reusable = (
                       "cc by" in license_lower
+                      or "cc-by" in license_lower
+                      or "cc_by" in license_lower
                       or "cc0" in license_lower
                       or "public domain" in license_lower
                       or "public domain" in copyright_status
@@ -1012,6 +1022,180 @@ jobs:
               commons_search_cache[cache_key] = results
               return results
           
+          # Extra searchable sources: Openverse is free; Pexels/Pixabay need optional API keys.
+          # Keep metadata and the original image page URL for crediting in video descriptions.
+          from urllib.parse import quote
+          stock_cache = {}
+
+          def stock_candidate(url, title, creator, licence, licence_url, page_url, description, source, score=0.4):
+              return {
+                  "url": str(url or ""),
+                  "title": clean_text(title or source),
+                  "creator": clean_text(creator or ""),
+                  "license": licence,
+                  "license_url": licence_url,
+                  "foreign_landing_url": str(page_url or url or ""),
+                  "attribution": clean_text(creator or source),
+                  "description": clean_text(description or ""),
+                  "categories": "",
+                  "searchable_text": " ".join((str(title or ""), str(description or ""))),
+                  "match_score": score,
+                  "source": source,
+              }
+
+          def openverse_image_candidates(query):
+              try:
+                  response = requests.get(
+                      "https://api.openverse.org/v1/images/",
+                      params={"q": query, "page_size": 12,
+                              "license": "by,by-sa,cc0,pdm", "mature": "false"},
+                      headers={"User-Agent": "SignalBriefVideo/1.3 (image attribution in video description)"},
+                      timeout=20,
+                  )
+                  response.raise_for_status()
+                  results = []
+                  for item in response.json().get("results", []):
+                      if (item.get("license") or "").lower() not in {"by", "by-sa", "cc0", "pdm"}:
+                          continue
+                      url = item.get("url") or item.get("thumbnail")
+                      if not str(url or "").startswith("https://"):
+                          continue
+                      tags = " ".join(
+                          tag.get("name", "") if isinstance(tag, dict) else str(tag)
+                          for tag in (item.get("tags") or [])[:12]
+                      )
+                      results.append(stock_candidate(
+                          url, item.get("title"), item.get("creator"),
+                          "CC " + str(item.get("license") or "").upper(),
+                          item.get("license_url") or "",
+                          item.get("foreign_landing_url") or url,
+                          tags, "openverse", 0.48,
+                      ))
+                  return results
+              except Exception as exc:
+                  print(f"Openverse unavailable for {query!r}: {exc}")
+                  return []
+
+          def pexels_image_candidates(query):
+              if not pexels_key:
+                  return []
+              try:
+                  response = requests.get(
+                      "https://api.pexels.com/v1/search",
+                      params={"query": query, "per_page": 12, "orientation": "landscape"},
+                      headers={"Authorization": pexels_key}, timeout=20,
+                  )
+                  response.raise_for_status()
+                  return [stock_candidate(
+                      (photo.get("src") or {}).get("large") or (photo.get("src") or {}).get("medium"),
+                      photo.get("alt") or query, photo.get("photographer"),
+                      "Pexels License", "https://www.pexels.com/license/",
+                      photo.get("url"), photo.get("alt") or query, "pexels", 0.48,
+                  ) for photo in response.json().get("photos", [])]
+              except Exception as exc:
+                  print(f"Pexels unavailable for {query!r}: {exc}")
+                  return []
+
+          def pixabay_image_candidates(query):
+              if not pixabay_key:
+                  return []
+              try:
+                  response = requests.get(
+                      "https://pixabay.com/api/",
+                      params={"key": pixabay_key, "q": query, "per_page": 12,
+                              "image_type": "photo", "safesearch": "true"},
+                      timeout=20,
+                  )
+                  response.raise_for_status()
+                  return [stock_candidate(
+                      item.get("largeImageURL") or item.get("webformatURL"),
+                      item.get("tags") or query, item.get("user"),
+                      "Pixabay Content License", "https://pixabay.com/service/license-summary/",
+                      item.get("pageURL"), item.get("tags") or query, "pixabay", 0.46,
+                  ) for item in response.json().get("hits", [])]
+              except Exception as exc:
+                  print(f"Pixabay unavailable for {query!r}: {exc}")
+                  return []
+
+          def image_candidates(search_query):
+              cache_key = search_query.strip().lower()
+              if cache_key in stock_cache:
+                  return stock_cache[cache_key]
+              # Pull multiple libraries even if one is rate-limited.
+              results = []
+              for fetch in (commons_image_candidates, openverse_image_candidates,
+                            pexels_image_candidates, pixabay_image_candidates):
+                  try:
+                      results.extend(fetch(search_query))
+                  except Exception as exc:
+                      print(f"Image source {fetch.__name__} unavailable: {exc}")
+              unique = {}
+              for item in results:
+                  url = item.get("foreign_landing_url") or item.get("url")
+                  if item.get("url") and url:
+                      unique.setdefault(url, item)
+              stock_cache[cache_key] = list(unique.values())
+              by_source = {}
+              for item in stock_cache[cache_key]:
+                  source = item.get("source", "wikimedia")
+                  by_source[source] = by_source.get(source, 0) + 1
+              print(f"Image search {search_query!r}: {len(stock_cache[cache_key])} candidates by source {by_source}")
+              return stock_cache[cache_key]
+
+          # Final fallback uses Gemini image generation (requires billing). No fake evidence.
+          def generate_illustration(path, scene_title, visual_subject, passage_text):
+              if not enable_ai_images:
+                  return False
+              from PIL import ImageOps, ImageDraw, ImageFont
+              prompt = (
+                  "Create a landscape 16:9 editorial illustration to accompany a factual documentary. "
+                  "Visualise the subject symbolically and generically, not as a claimed authentic photo or screenshot. "
+                  "Never impersonate real news screenshots, fabricate documents or invent proof of allegations. "
+                  "If named people or real alleged incidents are mentioned, show neutral objects/settings instead. "
+                  "High-quality cinematic editorial illustration, no words, no logos, no watermark. "
+                  f"Investigation: {topic[:160]}. Scene: {scene_title[:150]}. "
+                  f"Subject: {visual_subject[:150]}. Narration: {passage_text[:280]}"
+              )
+              for attempt in range(2):
+                  try:
+                      response = requests.post(
+                          "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite-image:generateContent",
+                          headers={"x-goog-api-key": key, "Content-Type": "application/json"},
+                          json={
+                              "contents": [{"parts": [{"text": prompt}]}],
+                              "generationConfig": {
+                                  "responseModalities": ["IMAGE"],
+                                  "responseFormat": {"image": {"aspectRatio": "16:9"}},
+                              },
+                          },
+                          timeout=(20, 150),
+                      )
+                      if response.status_code == 429 or response.status_code >= 500:
+                          time.sleep(10 * (attempt + 1))
+                          continue
+                      response.raise_for_status()
+                      parts = response.json().get("candidates", [{}])[0].get("content", {}).get("parts", [])
+                      encoded = next(
+                          (part["inlineData"]["data"] for part in parts if part.get("inlineData", {}).get("data")),
+                          None,
+                      )
+                      if not encoded:
+                          print(f"Gemini image returned no image for {scene_title!r}")
+                          return False
+                      generated = Image.open(io.BytesIO(base64.b64decode(encoded))).convert("RGB")
+                      generated = ImageOps.fit(generated, (1920, 1080), method=Image.Resampling.LANCZOS)
+                      draw = ImageDraw.Draw(generated)
+                      font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+                      font = ImageFont.truetype(font_path, 25)
+                      draw.rounded_rectangle((1500, 100, 1870, 165), radius=10, fill=(15, 18, 25))
+                      draw.text((1522, 116), "AI ILLUSTRATION", font=font, fill=(240, 243, 248))
+                      generated.save(path, "JPEG", quality=88)
+                      return True
+                  except Exception as exc:
+                      print(f"Gemini image fallback attempt {attempt + 1} failed: {exc}")
+                      time.sleep(5)
+              return False
+
           attribution = []
           scene_manifest = []
           used_titles = set()
@@ -1048,7 +1232,7 @@ jobs:
                   if len(tokens(value)) >= 2 and key_value not in seen:
                       result.append(value)
                       seen.add(key_value)
-              return result[:3]
+              return result[:2]  # Avoid excessive API calls and rate-limiting.
           
           def download_candidate(candidate):
               request = urllib.request.Request(
@@ -1057,8 +1241,8 @@ jobs:
               )
               with urllib.request.urlopen(request, timeout=25) as image_response:
                   content_type = image_response.headers.get("Content-Type", "").split(";")[0].lower()
-                  raw = image_response.read(5 * 1024 * 1024 + 1)
-              if content_type not in ("image/jpeg", "image/png", "image/webp") or len(raw) > 5 * 1024 * 1024:
+                  raw = image_response.read(12 * 1024 * 1024 + 1)
+              if content_type not in ("image/jpeg", "image/png", "image/webp") or len(raw) > 12 * 1024 * 1024:
                   return None
               image = Image.open(io.BytesIO(raw)).convert("RGB")
               if image.width < 600 or image.height < 350:
@@ -1165,7 +1349,7 @@ jobs:
                   overlap = len(subject_tokens & candidate_tokens)
                   candidate["semantic_score"] = overlap / max(1, len(subject_tokens))
               candidate_pool.sort(key=lambda item: (item.get("semantic_score", 0), item.get("match_score", 0)), reverse=True)
-              plausible = [candidate for candidate in candidate_pool if candidate.get("semantic_score", 0) >= 0.12 or candidate.get("match_score", 0) >= 0.45]
+              plausible = [candidate for candidate in candidate_pool if candidate.get("semantic_score", 0) >= 0.08 or candidate.get("match_score", 0) >= 0.35]
               selected = judge_visual_relevance(passage["text"], scene_title, visual_subject, plausible[:3]) if plausible else None
           
               if selected:
@@ -1195,7 +1379,7 @@ jobs:
                   print(f"WARNING: no candidate passed visual relevance check for scene {scene_index:02d}; using an original explanatory graphic rather than an unrelated photo.")
           
               attribution.append(selected)
-              visual_kind = "commons" if selected.get("license") != "Original graphic" else "original_graphic"
+              visual_kind = "licensed_image" if selected.get("license") != "Original graphic" else "original_graphic"
           
               scene_manifest.append({
                   "index": scene_index,
@@ -1248,26 +1432,58 @@ jobs:
                   scene["visual_confidence"] = 0
                   print("Repaired invalid/blank visual for scene " + str(scene["index"]))
 
-          # IMPORTANT: never render dozens of empty-looking title cards. Before
-          # rendering, replace temporary fallback cards with traceable, licensed
-          # illustrative b-roll already approved for this SAME investigation.
-          # Do not represent reused b-roll as actual footage of the alleged event.
+          # Replace remaining temporary text cards with AI illustrations or approved
+          # relevant library b-roll. Never publish generic text-only slides.
           from PIL import ImageDraw, ImageFont, ImageOps
-          confirmed = [
-              i for i, scene in enumerate(scene_manifest)
-              if scene["visual_kind"] == "commons"
-          ]
-          unique_sources = {attribution[i].get("foreign_landing_url") or attribution[i].get("title") for i in confirmed}
-          minimum_distinct = 7
-          if len(unique_sources) < minimum_distinct:
-              raise SystemExit(
-                  f"VISUAL QUALITY BLOCK: only {len(unique_sources)} distinct licensed pictures "
-                  f"for {len(scene_manifest)} scenes. Nothing was uploaded. "
-                  "Wikimedia/visual matching returned too few images; try again or improve the sources."
-              )
+          confirmed = [i for i, scene in enumerate(scene_manifest) if scene["visual_kind"] == "licensed_image"]
+          missing = [i for i, scene in enumerate(scene_manifest) if scene["visual_kind"] == "original_graphic"]
+          ai_count = 0
+          if missing and enable_ai_images:
+              # Generate unique illustrations distributed throughout the story.
+              # Limit paid requests so costs remain bounded.
+              target_unique = max(8, (len(scene_manifest) + 3) // 4)
+              needed = max(0, target_unique - len(confirmed))
+              n_to_generate = min(len(missing), max_ai_images, needed)
+              stride = max(1, len(missing) / max(1, n_to_generate))
+              positions = [missing[min(len(missing) - 1, int(i * stride))] for i in range(n_to_generate)]
+              for pos in sorted(set(positions)):
+                  scene = scene_manifest[pos]
+                  filename = scene["file"]
+                  if not generate_illustration(
+                      images / filename, scene.get("title", ""), scene.get("visual_subject", ""),
+                      passages[pos]["text"],
+                  ):
+                      continue
+                  scene["visual_kind"] = "ai_generated"
+                  scene["visual_confidence"] = 0.65
+                  attribution[pos] = {
+                      "url": "", "title": scene.get("visual_subject", "") or scene.get("title", ""),
+                      "creator": "Signal Brief / Gemini", "license": "AI-generated illustration",
+                      "license_url": "", "foreign_landing_url": "",
+                      "attribution": "AI-generated editorial illustration; not a photograph or evidence of the claimed event",
+                      "match_score": 0, "file": filename, "scene": scene["index"],
+                      "search_query": "Gemini AI illustration for narration scene",
+                      "visual_subject": scene.get("visual_subject", ""),
+                      "visual_intent": scene.get("visual_intent", ""),
+                      "visual_confidence": 0.65, "reused_fallback": True,
+                  }
+                  confirmed.append(pos)
+                  ai_count += 1
+                  print(f"Visual fallback: generated labelled AI illustration for scene {scene['index']}.")
 
-          reuse_count = {i: 0 for i in confirmed}
-          max_reuses_per_source = 5  # Each photo appears at most six times including original.
+          # One source may appear at most 4 times in total, including original.
+          max_uses = 4
+          scene_use_counts = {pos: 1 for pos in confirmed}
+          real_count = sum(scene_manifest[i]["visual_kind"] == "licensed_image" for i in confirmed)
+          unique_available = len(confirmed)
+          remaining = sum(scene["visual_kind"] == "original_graphic" for scene in scene_manifest)
+          if unique_available < 8 or remaining > sum(max_uses - scene_use_counts[i] for i in confirmed):
+              raise SystemExit(
+                  "VISUAL QUALITY BLOCK: not enough distinct images to fill this video without "
+                  f"excessive duplication (real={real_count}, AI={ai_count}, missing={remaining}, "
+                  f"max AI images={max_ai_images}, AI enabled={enable_ai_images}). "
+                  "Nothing uploaded. Add a Pexels/Pixabay key or enable billed Gemini images."
+              )
           illustration_count = 0
           for pos, scene in enumerate(scene_manifest):
               if scene["visual_kind"] != "original_graphic":
@@ -1276,32 +1492,24 @@ jobs:
                   scene.get("visual_subject", "") + " " + scene.get("title", "")
                   + " " + passages[pos]["text"]
               )
-              eligible = [i for i in confirmed if reuse_count[i] < max_reuses_per_source]
+              eligible = [i for i in confirmed if scene_use_counts[i] < max_uses]
               if not eligible:
-                  raise SystemExit(
-                      "VISUAL QUALITY BLOCK: not enough independent licensed photos to fill "
-                      "the film without repeated title slides. Nothing was uploaded."
-                  )
+                  raise SystemExit("VISUAL QUALITY BLOCK: insufficient image variety. Nothing uploaded.")
               def fit_score(i):
                   candidate = scene_manifest[i]
                   terms = tokens(candidate.get("visual_subject", "") + " " + candidate.get("title", ""))
-                  return (
-                      len(terms & target),
-                      -reuse_count[i],
-                      -abs(i - pos)
-                  )
+                  return (len(terms & target), -scene_use_counts[i], -abs(i - pos))
               original = max(eligible, key=fit_score)
               source_path = images / scene_manifest[original]["file"]
               target_path = images / scene["file"]
               with Image.open(source_path) as source_image:
                   rendered = ImageOps.fit(source_image.convert("RGB"), (1920, 1080), method=Image.Resampling.LANCZOS)
               drawer = ImageDraw.Draw(rendered)
-              try:
-                  stamp_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 28)
-              except OSError:
-                  stamp_font = ImageFont.load_default()
-              drawer.rounded_rectangle((1410, 120, 1875, 178), radius=13, fill=(13, 17, 24))
-              drawer.text((1430, 132), "ILLUSTRATIVE VISUAL", font=stamp_font, fill=(231, 239, 245))
+              stamp_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 27)
+              # Never make reused imagery appear to depict a specific alleged event.
+              label = "AI ILLUSTRATION" if scene_manifest[original]["visual_kind"] == "ai_generated" else "ILLUSTRATIVE VISUAL"
+              drawer.rounded_rectangle((1380, 120, 1880, 182), radius=13, fill=(13, 17, 24))
+              drawer.text((1405, 137), label, font=stamp_font, fill=(231, 239, 245))
               rendered.save(target_path, "JPEG", quality=88)
               credits = dict(attribution[original])
               credits.update({
@@ -1310,21 +1518,21 @@ jobs:
                   "visual_intent": scene.get("visual_intent", ""),
                   "reused_fallback": True,
                   "reused_from_scene": scene_manifest[original]["index"],
-                  "attribution": (credits.get("attribution", "") + "; reused as illustrative b-roll, not evidence of an alleged event").strip("; "),
+                  "attribution": (credits.get("attribution", "") + "; illustrative b-roll, not evidence of an alleged event").strip("; "),
               })
               attribution[pos] = credits
-              scene["visual_kind"] = "commons"
-              scene["visual_confidence"] = 0.60
+              scene["visual_kind"] = scene_manifest[original]["visual_kind"]
+              scene["visual_confidence"] = 0.55
               scene["reused_broll"] = True
-              reuse_count[original] += 1
+              scene_use_counts[original] += 1
               illustration_count += 1
           print(
-              f"Visual integrity: {len(unique_sources)} distinct licensed source images, "
-              f"{illustration_count} additional labelled b-roll uses, 0 text-card fallbacks "
-              f"across {len(scene_manifest)} scenes."
+              f"Visual integrity: {real_count} directly selected licensed images, "
+              f"{ai_count} generated AI illustrations, {illustration_count} labelled b-roll repeats "
+              f"across {len(scene_manifest)} scenes; zero generic text cards."
           )
-          if any(scene["visual_kind"] != "commons" for scene in scene_manifest):
-              raise SystemExit("VISUAL QUALITY BLOCK: unexpected graphic-only scene survived the b-roll pass.")
+          if any(scene["visual_kind"] == "original_graphic" for scene in scene_manifest):
+              raise SystemExit("VISUAL QUALITY BLOCK: a generic card survived the final visual replacement.")
 
           (out / "attribution.json").write_text(
               json.dumps(attribution, indent=2, ensure_ascii=False),
@@ -1542,7 +1750,7 @@ jobs:
                   f"Quality check failed: {len(scenes)} scenes but {len(images)} images. "
                   "Every scene must have its own verified image."
               )
-          allowed_visual_kinds = {"commons", "original_graphic"}
+          allowed_visual_kinds = {"licensed_image", "ai_generated"}
           invalid_scenes = [
               scene.get("index", "?")
               for scene in scenes
@@ -1550,18 +1758,26 @@ jobs:
           ]
           if invalid_scenes:
               raise SystemExit(
-                  "Quality check failed: scenes have an unsupported visual type: "
+                  "Quality check failed: scenes have an unsupported/placeholder visual type: "
                   + ", ".join(map(str, invalid_scenes))
               )
-          commons_count = sum(1 for scene in scenes if scene.get("visual_kind") == "commons")
-          graphic_count = sum(1 for scene in scenes if scene.get("visual_kind") == "original_graphic")
-          if commons_count + graphic_count != len(scenes):
+          licensed_count = sum(1 for scene in scenes if scene.get("visual_kind") == "licensed_image")
+          ai_scene_count = sum(1 for scene in scenes if scene.get("visual_kind") == "ai_generated")
+          if licensed_count + ai_scene_count != len(scenes):
               raise SystemExit("Quality check failed: one or more scenes have no usable visual.")
-          distinct = {item.get("foreign_landing_url") or item.get("title") for item in attribution if item.get("license") != "Original graphic"}
-          if len(distinct) < 7 or graphic_count:
+          distinct_real = {
+              item.get("foreign_landing_url") or item.get("title")
+              for item in attribution
+              if item.get("license") not in {"Original graphic", "AI-generated illustration"}
+          }
+          distinct_ai = {
+              item.get("reused_from_scene") or item.get("scene")
+              for item in attribution if item.get("license") == "AI-generated illustration"
+          }
+          if len(distinct_real) + len(distinct_ai) < 8:
               raise SystemExit(
-                  f"VISUAL QUALITY BLOCK: {len(distinct)} distinct licensed sources and "
-                  f"{graphic_count} generic fallback graphics. Refusing to render or upload this video."
+                  f"VISUAL QUALITY BLOCK: only {len(distinct_real)} unique real image sources and "
+                  f"{len(distinct_ai)} unique AI illustrations. Refusing to render/upload."
               )
 
           for image in images:
@@ -1577,8 +1793,8 @@ jobs:
 
           print(f"Script: {len(words)} words")
           print(f"Narration: {duration:.1f} seconds")
-          print(f"Scenes with verified licensed Commons images: {commons_count}")
-          print(f"Scenes with original context graphics: {graphic_count}")
+          print(f"Scenes with verified licensed images: {licensed_count}")
+          print(f"Scenes with AI illustrations: {ai_scene_count}")
           print("Pre-production quality checks passed.")
           PY
 
@@ -1978,7 +2194,7 @@ jobs:
           description_lines += [
               "",
               "IMAGE CREDITS AND LICENCES",
-              "Each linked Wikimedia Commons file page identifies the image title, creator and licence terms.",
+              "Images come from Wikimedia Commons, Openverse, Pexels and Pixabay, where available. Review each linked source and licence before publishing.",
           ]
           licence_groups = {}
           generated_count = 0
@@ -1987,13 +2203,13 @@ jobs:
               source_url = item.get("foreign_landing_url") or ""
               if source_url:
                   licence_groups.setdefault(licence_name, set()).add(source_url)
-              elif licence_name == "Generated graphic":
+              elif licence_name == "AI-generated illustration":
                   generated_count += 1
           for licence_name, source_urls in sorted(licence_groups.items()):
               description_lines.append(licence_name + ": " + " ".join(sorted(source_urls)))
           if generated_count:
               description_lines.append(
-                  f"Generated context cards: {generated_count}; created by Signal Brief for this video."
+                  f"AI-generated illustrative scene uses: {generated_count}; not photographic evidence of actual events."
               )
           description_lines += [
               "",
@@ -2023,6 +2239,7 @@ jobs:
           status_body = {
               "privacyStatus": "private",
               "selfDeclaredMadeForKids": False,
+              "containsSyntheticMedia": bool(generated_count),
           }
           event_name = os.environ.get("GITHUB_EVENT_NAME", "workflow_dispatch")
           scheduled_publish_at = None
