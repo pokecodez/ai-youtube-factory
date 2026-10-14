@@ -380,6 +380,9 @@ jobs:
           except Exception:
               history_data = {"topics": []}
           previous_topics = [str(value) for value in history_data.get("topics", [])]
+          # Seed the known earlier story: the original upload predates persisted history.
+          previous_topics.append("Are U.S. Troops Fighting Reptilians? Investigating the Viral Fake Image")
+          previous_topics.append("Fact Check: FAKE Image Of U.S. Troops Shooting 'Reptilians' Is NOT Real Photo - Lead Stories")
 
           def topic_tokens(value):
               ignored = {"the", "and", "for", "with", "from", "that", "this", "are", "was", "were", "what", "why", "how", "into", "about", "viral", "video", "investigating"}
@@ -788,12 +791,12 @@ jobs:
           Create exactly one visual beat for every narration passage, preserving all indices and order. Read the ENTIRE investigation topic and each passage together before deciding what the image should depict. Understand references, pronouns, irony, metaphors, allegations, and the sentence's actual subject. Never match an image to a single word in isolation.
           The visual must represent the central SUBJECT or EVIDENCE being discussed in that exact passage. Example: if the investigation discusses a conspiracy theory about a reptilian race allegedly seeking to destroy the world, the word “destroy” does NOT mean search for a burning building. Choose a clearly illustrative reptilian-humanoid/conspiracy-culture visual, the person or source making the claim, or the specific document/post being discussed. Never present a fictional or alleged event as proven fact.
           Identify the passage's role (claim, person, location, document, timeline, evidence, counterargument, or conclusion), then choose the most informative visual for that role. Prefer directly relevant people, named places, real documents, screenshots or public records when available. Use illustrations only when suitable to explain a theory or abstract idea. Do not use generic disaster, fire, courtroom, city, or “mysterious” stock images just because a verb or mood suggests them. Never imply a generic image depicts the actual event.
-          The keyword, visual_subject, and query must describe the SAME thing. The query must be a specific 3–8 word phrase suitable for Wikimedia Commons. Do not use generic keywords like “news”, “story”, “destroy”, “controversy”, or “documentary”. If no new entity appears, choose a concrete detail from the passage's actual meaning, not the first few words. If no trustworthy direct visual exists, describe an honest explanatory visual rather than pretending an unrelated photo is evidence. Image beats must be at least 1.0 second apart; timings are based on narration audio. Current investigation: {topic}
+          The keyword, visual_subject, and query must describe the SAME thing. The query must be a short, FINDABLE Wikimedia Commons search phrase (usually 2–5 words), not a description of a hypothetical website screen or made-up screenshot. Prefer subjects that really have reusable photos: U.S. military training, journalists working, an ordinary smartphone, a television newsroom, computer image editing, computer displays, archive files, and genuine named people or places. Do NOT search for the exact viral fake image as if it were verified evidence. A REAL, clearly illustrative shot of the investigation's subject is better than an impossible "computer showing the precise article" request. For abstract passages, reuse a recurring visual theme (reporting, phones, investigations) rather than inventing a specific document or interface. Make sure visual subjects vary across the film. Image beats must be at least 1.0 second apart; timings are based on narration audio. Current investigation: {topic}
           
           PASSAGES:
           """
           script_words = script.split()
-          chunk_size = 18
+          chunk_size = 28  # Fewer, better-researched images (about 35-45 for a 6-minute film).
           scene_count = (len(script_words) + chunk_size - 1) // chunk_size
           passages = []
           for index in range(scene_count):
@@ -905,7 +908,7 @@ jobs:
                   "generator": "search",
                   "gsrsearch": search_query,
                   "gsrnamespace": 6,
-                  "gsrlimit": 30,
+                  "gsrlimit": 18,
                   "prop": "imageinfo",
                   "iiprop": "url|extmetadata",
                   "iiurlwidth": 1920,
@@ -917,7 +920,7 @@ jobs:
               }
               response = None
               for attempt in range(5):
-                  wait_for_slot = 2.5 - (time.monotonic() - commons_last_request)
+                  wait_for_slot = 3.0 - (time.monotonic() - commons_last_request)
                   if wait_for_slot > 0:
                       time.sleep(wait_for_slot)
                   try:
@@ -1060,14 +1063,14 @@ jobs:
               image = Image.open(io.BytesIO(raw)).convert("RGB")
               if image.width < 600 or image.height < 350:
                   return None
-              image.thumbnail((640, 640))
+              image.thumbnail((1600, 1600))
               buffer = io.BytesIO()
-              image.save(buffer, format="JPEG", quality=78, optimize=True)
+              image.save(buffer, format="JPEG", quality=86, optimize=True)
               return buffer.getvalue()
           
           def judge_visual_relevance(passage_text, scene_title, visual_subject, candidates):
               prepared = []
-              for candidate in candidates[:2]:
+              for candidate in candidates[:3]:
                   try:
                       image_bytes = download_candidate(candidate)
                       if image_bytes:
@@ -1078,11 +1081,14 @@ jobs:
               if not prepared:
                   return None
               prompt = (
-                  "Inspect the actual candidate image(s), not just their titles. Decide which image directly depicts the subject or evidence "
-                  "in the narration passage. Shared keywords are not enough. Reject generic fire, disaster, building, city, or courtroom images "
-                  "when the passage is about a different subject or an abstract conspiracy claim. An illustration may explain a theory but must "
-                      "not be presented as proof of it. Return JSON only with keys best_candidate, confidence, and reason. "
-                  "Candidate index is 1 or 2; use 0 if none fits. Confidence is 0 to 1. Only approve a direct and accurate match with confidence >= 0.68.\n"
+                  "Inspect the actual image(s) and select a visually interesting, FACTUALLY HONEST supporting visual. "
+                  "A direct photo of the specific documented person/place/object is best, but ordinary relevant documentary B-ROLL "
+                  "(a phone being used during discussion of viral posts, reporters during discussion of fact-checking, "
+                  "soldiers during discussion of the real U.S. military) is ALLOWED as an *illustration*, not as proof "
+                  "of the viral allegation. NEVER claim an illustrative shot is evidence, footage of an alleged event, "
+                  "or a screenshot of a specific claim. Reject irrelevant photos, misleading representation, or text-only screenshots. "
+                  "Choose the best candidate, or 0 if all are truly unrelated. Return JSON with best_candidate, "
+                  "confidence and reason. Indices are 1 to 3; confidence is 0 to 1.\n"
                   f"Investigation topic: {topic}\nScene title: {scene_title}\nVisual subject: {visual_subject}\nNarration passage: {passage_text}\n"
               )
               for index, (candidate, _) in enumerate(prepared, start=1):
@@ -1109,7 +1115,7 @@ jobs:
                   confidence = float(judgement.get("confidence", 0))
                   reason = clean_text(judgement.get("reason", ""))
                   print(f"Visual relevance judgement: candidate={choice}, confidence={confidence:.2f}, reason={reason}")
-                  if choice < 1 or choice > len(prepared) or confidence < 0.68:
+                  if choice < 1 or choice > len(prepared) or confidence < 0.60:
                       return None
                   selected = dict(prepared[choice - 1][0])
                   selected["_image_bytes"] = prepared[choice - 1][1]
@@ -1159,8 +1165,8 @@ jobs:
                   overlap = len(subject_tokens & candidate_tokens)
                   candidate["semantic_score"] = overlap / max(1, len(subject_tokens))
               candidate_pool.sort(key=lambda item: (item.get("semantic_score", 0), item.get("match_score", 0)), reverse=True)
-              plausible = [candidate for candidate in candidate_pool if candidate.get("semantic_score", 0) >= 0.22 or candidate.get("match_score", 0) >= 0.72]
-              selected = judge_visual_relevance(passage["text"], scene_title, visual_subject, plausible[:2]) if plausible else None
+              plausible = [candidate for candidate in candidate_pool if candidate.get("semantic_score", 0) >= 0.12 or candidate.get("match_score", 0) >= 0.45]
+              selected = judge_visual_relevance(passage["text"], scene_title, visual_subject, plausible[:3]) if plausible else None
           
               if selected:
                   filename = f"image-{scene_index}.jpg"
@@ -1241,6 +1247,84 @@ jobs:
                   scene["visual_kind"] = "original_graphic"
                   scene["visual_confidence"] = 0
                   print("Repaired invalid/blank visual for scene " + str(scene["index"]))
+
+          # IMPORTANT: never render dozens of empty-looking title cards. Before
+          # rendering, replace temporary fallback cards with traceable, licensed
+          # illustrative b-roll already approved for this SAME investigation.
+          # Do not represent reused b-roll as actual footage of the alleged event.
+          from PIL import ImageDraw, ImageFont, ImageOps
+          confirmed = [
+              i for i, scene in enumerate(scene_manifest)
+              if scene["visual_kind"] == "commons"
+          ]
+          unique_sources = {attribution[i].get("foreign_landing_url") or attribution[i].get("title") for i in confirmed}
+          minimum_distinct = 7
+          if len(unique_sources) < minimum_distinct:
+              raise SystemExit(
+                  f"VISUAL QUALITY BLOCK: only {len(unique_sources)} distinct licensed pictures "
+                  f"for {len(scene_manifest)} scenes. Nothing was uploaded. "
+                  "Wikimedia/visual matching returned too few images; try again or improve the sources."
+              )
+
+          reuse_count = {i: 0 for i in confirmed}
+          max_reuses_per_source = 5  # Each photo appears at most six times including original.
+          illustration_count = 0
+          for pos, scene in enumerate(scene_manifest):
+              if scene["visual_kind"] != "original_graphic":
+                  continue
+              target = tokens(
+                  scene.get("visual_subject", "") + " " + scene.get("title", "")
+                  + " " + passages[pos]["text"]
+              )
+              eligible = [i for i in confirmed if reuse_count[i] < max_reuses_per_source]
+              if not eligible:
+                  raise SystemExit(
+                      "VISUAL QUALITY BLOCK: not enough independent licensed photos to fill "
+                      "the film without repeated title slides. Nothing was uploaded."
+                  )
+              def fit_score(i):
+                  candidate = scene_manifest[i]
+                  terms = tokens(candidate.get("visual_subject", "") + " " + candidate.get("title", ""))
+                  return (
+                      len(terms & target),
+                      -reuse_count[i],
+                      -abs(i - pos)
+                  )
+              original = max(eligible, key=fit_score)
+              source_path = images / scene_manifest[original]["file"]
+              target_path = images / scene["file"]
+              with Image.open(source_path) as source_image:
+                  rendered = ImageOps.fit(source_image.convert("RGB"), (1920, 1080), method=Image.Resampling.LANCZOS)
+              drawer = ImageDraw.Draw(rendered)
+              try:
+                  stamp_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 28)
+              except OSError:
+                  stamp_font = ImageFont.load_default()
+              drawer.rounded_rectangle((1410, 120, 1875, 178), radius=13, fill=(13, 17, 24))
+              drawer.text((1430, 132), "ILLUSTRATIVE VISUAL", font=stamp_font, fill=(231, 239, 245))
+              rendered.save(target_path, "JPEG", quality=88)
+              credits = dict(attribution[original])
+              credits.update({
+                  "file": scene["file"], "scene": scene["index"],
+                  "visual_subject": scene.get("visual_subject", ""),
+                  "visual_intent": scene.get("visual_intent", ""),
+                  "reused_fallback": True,
+                  "reused_from_scene": scene_manifest[original]["index"],
+                  "attribution": (credits.get("attribution", "") + "; reused as illustrative b-roll, not evidence of an alleged event").strip("; "),
+              })
+              attribution[pos] = credits
+              scene["visual_kind"] = "commons"
+              scene["visual_confidence"] = 0.60
+              scene["reused_broll"] = True
+              reuse_count[original] += 1
+              illustration_count += 1
+          print(
+              f"Visual integrity: {len(unique_sources)} distinct licensed source images, "
+              f"{illustration_count} additional labelled b-roll uses, 0 text-card fallbacks "
+              f"across {len(scene_manifest)} scenes."
+          )
+          if any(scene["visual_kind"] != "commons" for scene in scene_manifest):
+              raise SystemExit("VISUAL QUALITY BLOCK: unexpected graphic-only scene survived the b-roll pass.")
 
           (out / "attribution.json").write_text(
               json.dumps(attribution, indent=2, ensure_ascii=False),
@@ -1473,6 +1557,12 @@ jobs:
           graphic_count = sum(1 for scene in scenes if scene.get("visual_kind") == "original_graphic")
           if commons_count + graphic_count != len(scenes):
               raise SystemExit("Quality check failed: one or more scenes have no usable visual.")
+          distinct = {item.get("foreign_landing_url") or item.get("title") for item in attribution if item.get("license") != "Original graphic"}
+          if len(distinct) < 7 or graphic_count:
+              raise SystemExit(
+                  f"VISUAL QUALITY BLOCK: {len(distinct)} distinct licensed sources and "
+                  f"{graphic_count} generic fallback graphics. Refusing to render or upload this video."
+              )
 
           for image in images:
               if image.stat().st_size < 10000:
@@ -1896,11 +1986,11 @@ jobs:
               licence_name = item.get("license") or "Licence listed on source page"
               source_url = item.get("foreign_landing_url") or ""
               if source_url:
-                  licence_groups.setdefault(licence_name, []).append(source_url)
+                  licence_groups.setdefault(licence_name, set()).add(source_url)
               elif licence_name == "Generated graphic":
                   generated_count += 1
           for licence_name, source_urls in sorted(licence_groups.items()):
-              description_lines.append(licence_name + ": " + " ".join(source_urls))
+              description_lines.append(licence_name + ": " + " ".join(sorted(source_urls)))
           if generated_count:
               description_lines.append(
                   f"Generated context cards: {generated_count}; created by Signal Brief for this video."
