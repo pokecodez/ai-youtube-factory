@@ -8,7 +8,11 @@ on:
     - cron: "0 14 * * *"
 
 permissions:
-  contents: read
+  contents: write
+
+concurrency:
+  group: signal-brief-video-factory
+  cancel-in-progress: false
 
 jobs:
   build-video:
@@ -367,6 +371,38 @@ jobs:
               item["story_score"] = len({other["source"] for other in corroborating})
               item["investigative_relevance"] = investigative_relevance(item)
           
+          # Avoid repeating topics already produced by this workflow. The history file
+          # is committed only after a successful upload, and starts with the user's
+          # existing reptilian-claim video so it is never selected again.
+          history_path = Path("topic-history.json")
+          try:
+              history_data = json.loads(history_path.read_text(encoding="utf-8")) if history_path.exists() else {"topics": []}
+          except Exception:
+              history_data = {"topics": []}
+          previous_topics = [str(value) for value in history_data.get("topics", [])]
+
+          def topic_tokens(value):
+              ignored = {"the", "and", "for", "with", "from", "that", "this", "are", "was", "were", "what", "why", "how", "into", "about", "viral", "video", "investigating"}
+              return {word for word in re.findall(r"[a-z0-9]+", str(value).lower()) if len(word) > 2 and word not in ignored}
+
+          def already_covered(item):
+              candidate = topic_tokens(item["headline"] + " " + item.get("summary", ""))
+              headline = topic_tokens(item["headline"])
+              for previous in previous_topics:
+                  old = topic_tokens(previous)
+                  if not old or not headline:
+                      continue
+                  overlap = len(headline & old) / max(1, len(headline | old))
+                  containment = len(headline & old) / max(1, min(len(headline), len(old)))
+                  if overlap >= 0.42 or containment >= 0.72:
+                      print("Skipping previously covered topic: " + item["headline"] + " (matches history: " + previous + ")")
+                      return True
+              return False
+
+          news_items = [item for item in news_items if not already_covered(item)]
+          if not news_items:
+              raise SystemExit("All discovered stories match previously uploaded topics. Rerun later for fresh topics.")
+
           social_research_items = [
               item for item in news_items
               if item["source"].startswith("Social topic research:")
@@ -1086,54 +1122,17 @@ jobs:
           
           for scene_index, passage in enumerate(passages, start=1):
               planned = scene_by_index.get(scene_index, {})
-              scene_title = clean_text(planned.get("title", ""))
+              scene_title = clean_text(planned.get("title", "")) or f"Investigation visual {scene_index}"
               keyword = clean_text(planned.get("keyword", ""))
               visual_subject = clean_text(planned.get("visual_subject", ""))
               visual_intent = clean_text(planned.get("visual_intent", ""))
               search_query = clean_text(planned.get("query", ""))
-
-              # Gemini occasionally returns placeholder labels ("Investigation visual 1")
-              # instead of actual subjects. Never search Commons for those placeholders.
-              generic_label = re.compile(r"^(investigation visual|visual|scene|image|photo|documentary visual)\\s*\\d*\\s*$", re.I)
-              if generic_label.match(scene_title):
-                  scene_title = ""
-              if generic_label.match(visual_subject):
-                  visual_subject = ""
-              if generic_label.match(keyword):
-                  keyword = ""
-              if generic_label.match(search_query):
-                  search_query = ""
-
-              # Build a topic-aware query from the actual narration when the planner
-              # omitted useful descriptions. This prevents searches for generic labels.
-              ignored_visual_words = tokens_ignored() | {
-                  "you", "your", "they", "them", "their", "there", "where", "what",
-                  "when", "which", "would", "could", "should", "because", "while",
-                  "also", "just", "really", "very", "more", "most", "some", "many",
-                  "much", "only", "still", "being", "been", "have", "has", "had",
-                  "were", "was", "are", "is", "not", "but", "can", "cannot", "does",
-                  "did", "its", "than", "then", "like", "such", "claim", "claims",
-                  "evidence", "story", "question", "people", "online", "internet"
-              }
-              passage_terms = [
-                  word for word in re.findall(r"[a-z0-9]+", passage["text"].lower())
-                  if len(word) > 3 and word not in ignored_visual_words
-              ]
-              # Keep distinct terms in passage order; topic anchors keep the query relevant.
-              passage_terms = list(dict.fromkeys(passage_terms))[:7]
-              topic_terms = list(dict.fromkeys(
-                  word for word in re.findall(r"[a-z0-9]+", topic.lower())
-                  if len(word) > 2 and word not in ignored_visual_words
-              ))[:5]
-              grounded_fallback = " ".join((topic_terms + passage_terms)[:9])
               if len(tokens(visual_subject)) < 2:
-                  visual_subject = keyword if len(tokens(keyword)) >= 2 else grounded_fallback
-              if len(tokens(keyword)) < 2:
+                  visual_subject = scene_title if len(tokens(scene_title)) >= 2 else keyword
+              if len(tokens(keyword)) < 1:
                   keyword = visual_subject
               if len(tokens(search_query)) < 2:
-                  search_query = grounded_fallback or visual_subject
-              if len(tokens(scene_title)) < 2:
-                  scene_title = visual_subject
+                  search_query = visual_subject
               queries = scene_search_queries(search_query, scene_title, visual_subject, keyword)
               print(f"Scene {scene_index:02d} subject '{visual_subject}' image search queries: {queries}")
               candidate_pool = []
@@ -1205,6 +1204,44 @@ jobs:
                   "visual_kind": visual_kind
               })
           
+          # Last-chance visual integrity check: repair missing, corrupt, tiny, or
+          # nearly blank scene files with a locally rendered explanatory card.
+          for position, scene in enumerate(scene_manifest):
+              image_path = images / scene["file"]
+              invalid = not image_path.is_file() or image_path.stat().st_size < 10000
+              if not invalid:
+                  try:
+                      with Image.open(image_path) as check_image:
+                          check_image.verify()
+                      with Image.open(image_path) as check_image:
+                          check_image = check_image.convert("RGB")
+                          if check_image.width < 600 or check_image.height < 350:
+                              invalid = True
+                          else:
+                              extrema = check_image.getextrema()
+                              if all((high - low) < 3 for low, high in extrema):
+                                  invalid = True
+                  except Exception:
+                      invalid = True
+              if invalid:
+                  title_for_card = scene.get("visual_subject") or scene.get("title") or topic
+                  passage_text = passages[position]["text"] if position < len(passages) else script
+                  make_context_card(image_path, title_for_card, passage_text)
+                  attribution[position] = {
+                      "url": "", "title": title_for_card,
+                      "creator": "Signal Brief", "license": "Original graphic",
+                      "license_url": "", "foreign_landing_url": "",
+                      "attribution": "Original explanatory graphic created by Signal Brief; not photographic evidence",
+                      "match_score": 0, "file": scene["file"], "scene": scene["index"],
+                      "search_query": "Image integrity check repaired the scene with an original explanatory graphic",
+                      "visual_subject": scene.get("visual_subject", ""),
+                      "visual_intent": scene.get("visual_intent", ""),
+                      "visual_confidence": 0, "reused_fallback": True
+                  }
+                  scene["visual_kind"] = "original_graphic"
+                  scene["visual_confidence"] = 0
+                  print("Repaired invalid/blank visual for scene " + str(scene["index"]))
+
           (out / "attribution.json").write_text(
               json.dumps(attribution, indent=2, ensure_ascii=False),
               encoding="utf-8"
@@ -1963,6 +2000,27 @@ jobs:
           else:
               print("Upload complete. Video is PRIVATE pending your review.")
           print("YouTube Studio URL: https://studio.youtube.com/video/" + video_id + "/edit")
+
+          # Persist the topic only after YouTube confirms the upload succeeded.
+          import subprocess
+          history_path = Path("topic-history.json")
+          try:
+              history_data = json.loads(history_path.read_text(encoding="utf-8")) if history_path.exists() else {"topics": []}
+          except Exception:
+              history_data = {"topics": []}
+          topics = history_data.setdefault("topics", [])
+          if topic and topic.casefold() not in {str(value).casefold() for value in topics}:
+              topics.append(topic)
+          history_path.write_text(json.dumps({"topics": topics[-500:]}, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+          subprocess.run(["git", "config", "user.name", "github-actions[bot]"], check=True)
+          subprocess.run(["git", "config", "user.email", "41898282+github-actions[bot]@users.noreply.github.com"], check=True)
+          subprocess.run(["git", "add", "topic-history.json"], check=True)
+          staged = subprocess.run(["git", "diff", "--cached", "--quiet"])
+          if staged.returncode == 1:
+              subprocess.run(["git", "commit", "-m", "Track uploaded video topic history"], check=True)
+              pushed = subprocess.run(["git", "push"], capture_output=True, text=True)
+              if pushed.returncode != 0:
+                  print("WARNING: upload succeeded, but topic history could not be pushed: " + pushed.stderr[-1000:])
           (out / "youtube-upload.txt").write_text(
               "Video ID: " + video_id + "\n"
               + "Studio URL: https://studio.youtube.com/video/" + video_id + "/edit\n"
