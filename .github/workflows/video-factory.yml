@@ -1086,17 +1086,54 @@ jobs:
           
           for scene_index, passage in enumerate(passages, start=1):
               planned = scene_by_index.get(scene_index, {})
-              scene_title = clean_text(planned.get("title", "")) or f"Investigation visual {scene_index}"
+              scene_title = clean_text(planned.get("title", ""))
               keyword = clean_text(planned.get("keyword", ""))
               visual_subject = clean_text(planned.get("visual_subject", ""))
               visual_intent = clean_text(planned.get("visual_intent", ""))
               search_query = clean_text(planned.get("query", ""))
+
+              # Gemini occasionally returns placeholder labels ("Investigation visual 1")
+              # instead of actual subjects. Never search Commons for those placeholders.
+              generic_label = re.compile(r"^(investigation visual|visual|scene|image|photo|documentary visual)\\s*\\d*\\s*$", re.I)
+              if generic_label.match(scene_title):
+                  scene_title = ""
+              if generic_label.match(visual_subject):
+                  visual_subject = ""
+              if generic_label.match(keyword):
+                  keyword = ""
+              if generic_label.match(search_query):
+                  search_query = ""
+
+              # Build a topic-aware query from the actual narration when the planner
+              # omitted useful descriptions. This prevents searches for generic labels.
+              ignored_visual_words = tokens_ignored() | {
+                  "you", "your", "they", "them", "their", "there", "where", "what",
+                  "when", "which", "would", "could", "should", "because", "while",
+                  "also", "just", "really", "very", "more", "most", "some", "many",
+                  "much", "only", "still", "being", "been", "have", "has", "had",
+                  "were", "was", "are", "is", "not", "but", "can", "cannot", "does",
+                  "did", "its", "than", "then", "like", "such", "claim", "claims",
+                  "evidence", "story", "question", "people", "online", "internet"
+              }
+              passage_terms = [
+                  word for word in re.findall(r"[a-z0-9]+", passage["text"].lower())
+                  if len(word) > 3 and word not in ignored_visual_words
+              ]
+              # Keep distinct terms in passage order; topic anchors keep the query relevant.
+              passage_terms = list(dict.fromkeys(passage_terms))[:7]
+              topic_terms = list(dict.fromkeys(
+                  word for word in re.findall(r"[a-z0-9]+", topic.lower())
+                  if len(word) > 2 and word not in ignored_visual_words
+              ))[:5]
+              grounded_fallback = " ".join((topic_terms + passage_terms)[:9])
               if len(tokens(visual_subject)) < 2:
-                  visual_subject = scene_title if len(tokens(scene_title)) >= 2 else keyword
-              if len(tokens(keyword)) < 1:
+                  visual_subject = keyword if len(tokens(keyword)) >= 2 else grounded_fallback
+              if len(tokens(keyword)) < 2:
                   keyword = visual_subject
               if len(tokens(search_query)) < 2:
-                  search_query = visual_subject
+                  search_query = grounded_fallback or visual_subject
+              if len(tokens(scene_title)) < 2:
+                  scene_title = visual_subject
               queries = scene_search_queries(search_query, scene_title, visual_subject, keyword)
               print(f"Scene {scene_index:02d} subject '{visual_subject}' image search queries: {queries}")
               candidate_pool = []
