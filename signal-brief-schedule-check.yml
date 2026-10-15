@@ -1,0 +1,24 @@
+name: Schedule Trigger Test (No Video Upload)
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "23 * * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  check-scheduler:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Report how the run started
+        run: |
+          echo "Triggered by: ${{ github.event_name }}"
+          echo "Cron: ${{ github.event.schedule }}"
+          date -u '+Current UTC time: %Y-%m-%d %H:%M:%S UTC'
+          if [ "${{ github.event_name }}" != "schedule" ]; then
+            echo "Manual test: GitHub Actions works, but this does NOT prove scheduling works."
+          else
+            echo "SUCCESS: GitHub scheduler triggered a workflow in this repository."
+          fi
