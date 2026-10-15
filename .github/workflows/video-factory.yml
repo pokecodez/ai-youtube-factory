@@ -1,11 +1,23 @@
 name: Signal Brief - Current News Video
 
+# External scheduler version: intentionally no GitHub cron trigger to avoid
+# duplicate uploads if GitHub's own scheduler later starts working again.
+# Use cron-job.org or another trusted scheduler to POST workflow_dispatch
+# with inputs.publish_slot = noon | afternoon | evening.
+# Manual GitHub runs default to a PRIVATE test upload.
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "17 6 * * *"
-    - cron: "17 11 * * *"
-    - cron: "17 14 * * *"
+    inputs:
+      publish_slot:
+        description: 'Publication slot (private = safe manual test)'
+        required: true
+        type: choice
+        default: private
+        options:
+          - private
+          - noon
+          - afternoon
+          - evening
 
 permissions:
   contents: write
@@ -2140,8 +2152,7 @@ jobs:
           YOUTUBE_CLIENT_ID: ${{ secrets.YOUTUBE_CLIENT_ID }}
           YOUTUBE_CLIENT_SECRET: ${{ secrets.YOUTUBE_CLIENT_SECRET }}
           YOUTUBE_REFRESH_TOKEN: ${{ secrets.YOUTUBE_REFRESH_TOKEN }}
-          GITHUB_EVENT_NAME: ${{ github.event_name }}
-          GITHUB_EVENT_SCHEDULE: ${{ github.event.schedule || '' }}
+          PUBLISH_SLOT: ${{ inputs.publish_slot || 'private' }}
         run: |
           set -euo pipefail
           python -m pip install --quiet google-api-python-client google-auth google-auth-httplib2
@@ -2241,29 +2252,27 @@ jobs:
               "selfDeclaredMadeForKids": False,
               "containsSyntheticMedia": bool(generated_count),
           }
-          event_name = os.environ.get("GITHUB_EVENT_NAME", "workflow_dispatch")
+          # Only explicitly marked dispatches schedule a YouTube release.
+          # The GitHub UI's default 'private' choice remains safe for testing.
+          publish_slot = os.environ.get("PUBLISH_SLOT", "private").strip().lower()
+          slot_to_hour = {"noon": 12, "afternoon": 17, "evening": 20}
+          if publish_slot not in slot_to_hour and publish_slot != "private":
+              raise SystemExit(f"Invalid publication slot: {publish_slot!r}")
           scheduled_publish_at = None
-          if event_name == "schedule":
-              schedule_to_hour = {
-                  "17 6 * * *": 12,
-                  "17 11 * * *": 17,
-                  "17 14 * * *": 20,
-              }
-              schedule_key = os.environ.get("GITHUB_EVENT_SCHEDULE", "")
-              if schedule_key not in schedule_to_hour:
-                  raise SystemExit(f"Unknown scheduled release slot: {schedule_key!r}")
+          if publish_slot in slot_to_hour:
               london = ZoneInfo("Europe/London")
               now_london = datetime.now(london)
               publish_local = now_london.replace(
-                  hour=schedule_to_hour[schedule_key], minute=0, second=0, microsecond=0
+                  hour=slot_to_hour[publish_slot], minute=0, second=0, microsecond=0
               )
+              # Never set a publication time less than 15 minutes away.
               if publish_local <= now_london + timedelta(minutes=15):
                   publish_local += timedelta(days=1)
               scheduled_publish_at = publish_local.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
               status_body["publishAt"] = scheduled_publish_at
-              print(f"Scheduled YouTube release for {publish_local.strftime('%A %d %B %Y at %H:%M')} UK time.")
+              print(f"External scheduler slot {publish_slot}: scheduling YouTube release for {publish_local.strftime('%A %d %B %Y at %H:%M')} UK time.")
           else:
-              print("Manual run: uploading as private for review; it will not publish automatically.")
+              print("Private test run: uploading privately for review, with no scheduled public release.")
 
           request = youtube.videos().insert(
               part="snippet,status",
