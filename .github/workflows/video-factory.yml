@@ -221,17 +221,24 @@ jobs:
           
           # Discover major non-political stories people are discussing online.
           # These searches are leads, not proof that a topic is trending.
+          # Search for broad-audience mysteries and recognisable internet stories,
+          # NOT arbitrary allegations about politicians or unfamiliar famous people.
           topic_searches = [
-              "viral internet mystery claim fact check evidence social media when:7d",
-              "major online conspiracy claim investigation fact check when:7d",
-              "celebrity scandal controversy investigation court documents when:7d",
-              "high profile case viral claims evidence fact check when:7d",
-              "Epstein alive claim fact check evidence social media when:30d",
-              "Bohemian Grove claims investigation evidence fact check when:30d",
-              "Diddy online claims misinformation fact check when:30d",
-              "viral celebrity controversy misinformation investigation when:7d",
+              "viral internet mystery explained evidence fact check when:7d",
+              "major online hoax deepfake exposed fact check when:7d",
+              "internet scam affecting thousands investigation when:7d",
+              "viral disturbing video origin explained fact check when:7d",
+              "AI deception viral video investigation when:7d",
+              "mysterious disappearance viral internet case evidence when:7d",
+              "famous unsolved mystery new evidence investigation when:30d",
+              "cult secret society viral theories explained evidence when:30d",
+              "widely shared conspiracy claim explained fact check when:7d",
+              "major influencer scandal viral evidence investigation when:7d",
+              "Epstein documents viral claim evidence fact check when:30d",
+              "Diddy viral claims what is verified fact check when:30d",
+              "Bohemian Grove claims evidence explained when:30d",
           ]
-          
+
           def is_political_topic(value):
               text_value = value.lower()
               # Explicitly keep the user's requested subject areas eligible.
@@ -426,54 +433,89 @@ jobs:
           if not news_items:
               raise SystemExit("All discovered stories match previously uploaded topics. Rerun later for fresh topics.")
 
-          social_research_items = [
-              item for item in news_items
-              if item["source"].startswith("Social topic research:")
-              and not is_political_topic(item["headline"] + " " + item["summary"])
-              and item["investigative_relevance"] >= 3
+          # Viewers should care about the QUESTION, not have to recognise the person's name.
+          # A random allegation involving a public figure is not sufficient.
+          broad_hooks = (
+              "mystery", "mysterious", "unsolved", "missing", "disappeared",
+              "hoax", "fake", "deepfake", "ai-generated", "scam", "fraud",
+              "viral", "conspiracy", "secret", "cult", "leaked", "hidden",
+              "cover-up", "fact check", "fact-check", "debunk", "evidence",
+              "internet", "online", "social media", "epstein", "diddy",
+              "bohemian grove", "massive", "millions", "thousands",
+          )
+          dull_coverage = (
+              "senator", "secretary of state", "marco rubio", "mark rubio",
+              "oprah", "oprah winfrey", "legislation", "bill passed",
+              "committee hearing", "press conference", "campaign",
+              "endorses", "appoints", "trade talks", "diplomatic",
+              "routine update", "announces new", "red carpet", "dating rumours",
+          )
+          def engaging_candidate(item):
+              headline = item["headline"].lower()
+              combined = (item["headline"] + " " + item["summary"]).lower()
+              if is_political_topic(combined) or any(term in combined for term in dull_coverage):
+                  return False
+              if any(term in combined for term in routine_entertainment_terms):
+                  return False
+              # Demand an understandable mystery / problem with concrete reporting.
+              return (any(term in combined for term in broad_hooks)
+                      and item["investigative_relevance"] >= 3
+                      and len(item["summary"].strip()) >= 30)
+
+          candidates = [item for item in news_items if engaging_candidate(item)]
+          if not candidates:
+              raise SystemExit("No engaging, evidence-led general-audience mystery found. Skipping upload rather than posting irrelevant celebrity or politician news.")
+
+          def audience_score(item):
+              combined = (item["headline"] + " " + item["summary"]).lower()
+              headline = item["headline"].lower()
+              score = item["investigative_relevance"] + min(item["story_score"], 5) * 3
+              score += 5 if item["published_dt"] >= now - timedelta(days=7) else 0
+              score += 5 if item["source"].startswith("Social topic research:") else 0
+              score += min(12, sum(3 for term in broad_hooks if term in headline))
+              # Fresh signals are clues, never proof of popularity.
+              for signal in social_topic_signals:
+                  if len(headline_tokens(signal) & headline_tokens(headline)) >= 2:
+                      score += 7
+                      break
+              if any(term in combined for term in ("epstein", "diddy", "bohemian grove")):
+                  score += 3  # familiar examples, never mandatory
+              if any(term in headline for term in ("says", "comments on", "responds to", "reacts to", "interview")):
+                  score -= 12
+              return score
+
+          candidates.sort(key=audience_score, reverse=True)
+          # Editorial second pass: reject obscure name-driven trivia even when
+          # keyword scoring accidentally rewards it. Use only supplied reporting.
+          shortlist = [
+              {"id": i, "headline": x["headline"], "summary": x["summary"][:380],
+               "score": audience_score(x), "source": x["source"]}
+              for i, x in enumerate(candidates[:18])
           ]
-          
-          # General feeds can corroborate a chosen story, but should not cause
-          # the channel to drift into routine politics or government coverage.
-          non_political_items = [
-              item for item in news_items
-              if not is_political_topic(item["headline"] + " " + item["summary"])
-          ]
-          if not non_political_items:
-              raise SystemExit("No suitable recent non-political story had accessible reporting. Rerun later.")
-          
-          if social_research_items:
-              selected_item = max(
-                  social_research_items,
-                  key=lambda item: (
-                      item["story_score"],
-                      item["investigative_relevance"],
-                      item["published_dt"] >= now - timedelta(hours=24),
-                      item["published_dt"]
-                  )
+          selection_prompt = f"""You are an extremely selective editor for a broad-audience YouTube mystery/investigation channel.
+          Pick ONE item by its integer id from the JSON list. Think about what a viewer with NO knowledge of the named people would find fascinating.
+          Good: an internet mystery, huge scam, bizarre viral footage and its true origin, internet cult, unexplained disappearance, mass deception, famous conspiracy tested against evidence, major recognisable scandal with a genuinely intriguing unanswered question.
+          BAD: a random politician or celebrity giving a statement, accusations against someone obscure, routine courtroom/political updates, local gossip, headlines interesting only because of a name, empty clickbait, old stories without a fresh evidence-led angle.
+          Requires clear stakes, an immediate 1-sentence hook understandable to strangers, and enough reported facts to sustain a deep dive. Never invent popularity. Do not select an allegation just because it sounds shocking.
+          Return ONLY JSON {{"id":integer,"reason":string}} or {{"id":null,"reason":string}} when none deserves upload.
+          Candidates: {json.dumps(shortlist, ensure_ascii=False)}"""
+          try:
+              selection_response = gemini_post(
+                  "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent",
+                  headers={"x-goog-api-key": key},
+                  json={"contents": [{"parts": [{"text": selection_prompt}]}],
+                        "generationConfig": {"temperature": 0.1, "maxOutputTokens": 300,
+                                             "responseMimeType": "application/json"}},
               )
-              print("Prioritising an investigative internet-culture story with recent reporting: " + selected_item["headline"])
-          else:
-              eligible_deep_dive_items = [
-                  item for item in non_political_items
-                  if item["investigative_relevance"] >= 3
-              ]
-              if not eligible_deep_dive_items:
-                  raise SystemExit(
-                      "No suitable investigative story about a major online controversy, mystery, "
-                      "scandal or disputed viral claim has enough recent reporting. The workflow will "
-                      "stop rather than create an unrelated routine news video. Rerun later."
-                  )
-              selected_item = max(
-                  eligible_deep_dive_items,
-                  key=lambda item: (
-                      item["story_score"],
-                      item["investigative_relevance"],
-                      item["published_dt"] >= now - timedelta(hours=24),
-                      item["published_dt"]
-                  )
-              )
-              print("Selected the strongest supported investigative story: " + selected_item["headline"])
+              selection_response.raise_for_status()
+              selection_text = "".join(part.get("text", "") for part in selection_response.json()["candidates"][0]["content"]["parts"])
+              selected_id = json.loads(selection_text).get("id")
+          except Exception as error:
+              raise SystemExit(f"Editorial topic review failed; skipping publication safely: {error}")
+          if type(selected_id) is not int or not 0 <= selected_id < len(shortlist):
+              raise SystemExit("No sufficiently compelling general-audience story. Skipping upload safely.")
+          selected_item = candidates[selected_id]
+          print("Selected general-audience investigation:", selected_item["headline"])
           related_items = [selected_item] + selected_item["corroborating"]
           related_items = sorted(related_items, key=lambda item: item["published_dt"], reverse=True)[:6]
           topic = selected_item["headline"]
@@ -606,10 +648,10 @@ jobs:
           
           Choose an investigative QUESTION, not a routine news update. The channel covers major internet mysteries, high-profile scandals, celebrity/influencer controversies, public-record mysteries, viral claims, alleged cover-ups, strange online theories, and misconceptions that deserve a proper evidence-led deep dive. Example framing: “Is Jeffrey Epstein Still Alive? Investigating the Claims” is a better format than a generic headline about a new court update. Epstein, Diddy and Bohemian Grove are examples of subject areas, not automatic choices. Pick them only when the supplied signals and evidence make a meaningful investigation possible. Avoid politics, elections, government policy, and routine daily headlines. Do not pick a random music/video release merely because it is trending. Use social posts to identify what people are asking or getting wrong, never as proof. If no suitable deep-dive topic has credible sources, stop rather than publish an unrelated story.
           
-          The narration MUST begin with this exact sentence, replacing the bracketed topic with the selected topic: “I am Signal Brief, and I will be discussing {topic}.” Immediately after that one-sentence identification, launch into the single most gripping, specific, evidence-grounded hook in the investigation. Do not add greetings, a long intro, or any other channel introduction. The hook should make the viewer want the answer without presenting an unproven claim as fact.
+          Begin with a startling, specific, well-supported QUESTION or detail about the mystery in the first 10 seconds. Do NOT say "I am Signal Brief" or "Today we'll be discussing". Explain unknown names in plain English before discussing them. Every passage must move the story forward; use a new reveal, a useful contradiction, or a clearer answer rather than filler. Never imply unverified allegations are established facts.
           
           Write 1,000–1,300 spoken words in natural British English, aiming for about 1,150. Structure the narration like a high-retention YouTube investigation:
-          1. After the required one-sentence channel identification, immediately open with the most gripping question or verified detail; no generic intro.
+          1. Open immediately with the most gripping question or verified detail; no generic channel intro.
           2. Explain the origin of the claim or mystery and why it spread online.
           3. Build a clear timeline of the key events and the strongest available evidence.
           4. Examine the main arguments people use to support the popular theory, one by one, and explain what the evidence actually shows.
@@ -718,15 +760,13 @@ jobs:
                   "Continuing because the draft is substantial and the evidence must not be padded."
               )
           
-          required_intro = f"I am Signal Brief, and I will be discussing {topic}."
-          script = re.sub(r"^\s*I am Signal Brief, and I will be discussing [^.]+\.\s*", "", script, flags=re.IGNORECASE)
-          script = required_intro + "\n\n" + script.lstrip()
+          script = re.sub(r"^\s*I am Signal Brief, and I will be discussing [^.]+\.\s*", "", script, flags=re.IGNORECASE).strip()
           word_count = len(script.split())
           (out / "script.txt").write_text(script, encoding="utf-8")
-          print(f"Investigative narration generated with required Signal Brief opening: {word_count} words.")
+          print(f"Investigative narration generated: {word_count} words.")
           
           title_prompt = f"""Create one accurate, compelling YouTube title for this SIGNAL BRIEF investigative video essay.
-          Prefer a clear question followed by an investigation framing, such as 'Is [claim] True? Investigating the Evidence' or 'What Really Happened to [subject]?'. Do not copy a news headline, do not use ALL CAPS, and do not imply a claim is true if the script investigates it. Make it intriguing but not misleading, ideally 45–75 characters and no more than 95 characters. Return only the title, with no quotation marks or explanation.
+          Lead with the universally understandable mystery or stakes, NOT an obscure person's name. Prefer a curiosity-generating question with clear, concrete stakes. Do not copy a news headline, do not use ALL CAPS, and do not imply a claim is true if the script investigates it. Make it intriguing but not misleading, ideally 45–75 characters and no more than 95 characters. Return only the title, with no quotation marks or explanation.
           Research lead: {topic}
           Narration: {script[:9000]}"""
           title_response = gemini_post(
@@ -750,6 +790,43 @@ jobs:
           (out / "video-title.txt").write_text(video_title, encoding="utf-8")
           print("Generated investigative title: " + video_title)
           
+          # Generate searchable metadata specific to the actual script, not generic spam.
+          metadata_prompt = f"""Produce VALID JSON with keys description (2 engaging, accurate
+          sentences explaining this exact video without spoilers), hashtags (3 relevant hashtag
+          strings starting #), and tags (12-18 relevant YouTube search phrases).
+          Cover this topic: {topic}
+          Title: {video_title}
+          Narration: {script[:9500]}
+          Rules: No fabricated popularity, unrelated popular people, false accusations,
+          generic trending tags, keyword stuffing or sensationalising unproven claims.
+          Every hashtag and search phrase must directly describe this video's subject,
+          closely related terms, or its evidence-based approach. Avoid repetition.
+          Return JSON only."""
+          metadata_response = gemini_post(
+              "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent",
+              headers={"x-goog-api-key": key},
+              json={"contents": [{"parts": [{"text": metadata_prompt}]}],
+                    "generationConfig": {"temperature": 0.3, "maxOutputTokens": 650,
+                                         "responseMimeType": "application/json"}},
+          )
+          metadata_response.raise_for_status()
+          metadata_text = "".join(part.get("text", "") for part in metadata_response.json()["candidates"][0]["content"]["parts"])
+          metadata_data = json.loads(metadata_text)
+          clean_hashtags = []
+          for value in metadata_data.get("hashtags", []):
+              value = "#" + re.sub(r"[^A-Za-z0-9_]", "", str(value).lstrip("#"))
+              if len(value) > 2 and value.casefold() not in {x.casefold() for x in clean_hashtags}:
+                  clean_hashtags.append(value)
+          clean_tags = []
+          for value in metadata_data.get("tags", []):
+              value = re.sub(r"\s+", " ", str(value)).strip(" ,#")[:60]
+              if len(value) >= 3 and value.casefold() not in {x.casefold() for x in clean_tags}:
+                  clean_tags.append(value)
+          (out / "video-metadata.json").write_text(json.dumps({
+              "description": str(metadata_data.get("description", ""))[:700],
+              "hashtags": clean_hashtags[:3], "tags": clean_tags[:18]
+          }, ensure_ascii=False, indent=2), encoding="utf-8")
+
           payload = {
               "contents": [{"parts": [{"text": script}]}],
               "generationConfig": {
@@ -2190,8 +2267,20 @@ jobs:
           if len(title) > 98:
               title = title[:95].rstrip() + "..."
           news_sources = json.loads((out / "news-sources.json").read_text(encoding="utf-8"))
+          video_metadata = json.loads((out / "video-metadata.json").read_text(encoding="utf-8"))
+          search_tags = video_metadata.get("tags", [])
+          # YouTube video tag field has an overall size limit. Reserve some space.
+          safe_tags = []
+          for tag in search_tags:
+              if len(",".join(safe_tags + [tag]).encode("utf-8")) > 440:
+                  break
+              safe_tags.append(tag)
 
           description_lines = [
+              video_metadata.get("description", ""),
+              "",
+              " ".join(video_metadata.get("hashtags", [])[:3]),
+              "",
               "SIGNAL BRIEF | Investigations, internet mysteries and the evidence behind viral claims.",
               "",
               "An evidence-led investigation based on the sources listed below. Online claims are assessed against available records and reporting; uncertainty is stated where evidence is incomplete.",
@@ -2280,6 +2369,7 @@ jobs:
                   "snippet": {
                       "title": title,
                       "description": description,
+                      "tags": safe_tags,
                       "categoryId": "27",
                       "defaultLanguage": "en-GB",
                   },
