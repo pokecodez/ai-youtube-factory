@@ -1,3 +1,2016 @@
+name: Signal Brief - Current News Video
+
+# External scheduler version: intentionally no GitHub cron trigger to avoid
+# duplicate uploads if GitHub's own scheduler later starts working again.
+# Use cron-job.org or another trusted scheduler to POST workflow_dispatch
+# with inputs.publish_slot = noon | afternoon | evening.
+# Manual GitHub runs default to a PRIVATE test upload.
+on:
+  workflow_dispatch:
+    inputs:
+      publish_slot:
+        description: 'Publication slot (private = safe manual test)'
+        required: true
+        type: choice
+        default: private
+        options:
+          - private
+          - noon
+          - afternoon
+          - evening
+
+permissions:
+  contents: write
+
+concurrency:
+  group: signal-brief-video-factory
+  cancel-in-progress: false
+
+jobs:
+  build-video:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          python -m pip install --upgrade pip
+          python -m pip install --quiet requests pillow "av==14.2.0" "faster-whisper==1.1.1" --only-binary=av
+
+      - name: Research current news, write narration and match visuals
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
+          PIXABAY_API_KEY: ${{ secrets.PIXABAY_API_KEY }}
+          ENABLE_AI_IMAGES: "false"  # Change to "true" after enabling paid Gemini image generation.
+          MAX_AI_IMAGES_PER_VIDEO: "18"
+        run: |
+          set -euo pipefail
+
+          cat > build.py <<'PY'
+          import os
+          import json
+          import base64
+          import wave
+          import requests
+          import subprocess
+          import urllib.request
+          import io
+          import re
+          import html
+          import random
+          import time
+          from pathlib import Path
+          from PIL import Image
+          
+          key = os.environ["GEMINI_API_KEY"]
+          pexels_key = os.environ.get("PEXELS_API_KEY", "").strip()
+          pixabay_key = os.environ.get("PIXABAY_API_KEY", "").strip()
+          enable_ai_images = os.environ.get("ENABLE_AI_IMAGES", "false").lower() == "true"
+          max_ai_images = max(0, min(24, int(os.environ.get("MAX_AI_IMAGES_PER_VIDEO", "18"))))
+          out = Path("output")
+          images = out / "images"
+          images.mkdir(parents=True, exist_ok=True)
+          
+          def gemini_post(url, **kwargs):
+              kwargs["timeout"] = (20, 300)
+              last_error = None
+              retry_delays = [10, 20, 40, 60, 90]
+              for attempt in range(len(retry_delays) + 1):
+                  try:
+                      result = requests.post(url, **kwargs)
+                      if result.status_code not in (408, 429, 500, 502, 503, 504):
+                          return result
+                      last_error = RuntimeError(
+                          f"Gemini returned HTTP {result.status_code}: {result.text[:500]}"
+                      )
+                      if attempt == len(retry_delays):
+                          result.raise_for_status()
+                          return result
+                      retry_after = result.headers.get("Retry-After", "")
+                      try:
+                          wait_seconds = min(120, max(retry_delays[attempt], int(retry_after))) if retry_after else retry_delays[attempt]
+                      except ValueError:
+                          wait_seconds = retry_delays[attempt]
+                  except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as error:
+                      last_error = error
+                      if attempt == len(retry_delays):
+                          raise RuntimeError(
+                              "Gemini API failed after 6 attempts. Wait a few minutes and rerun the workflow."
+                          ) from error
+                      wait_seconds = retry_delays[attempt]
+                  print(f"Gemini request attempt {attempt + 1}/6 failed; retrying in {wait_seconds}s.")
+                  time.sleep(wait_seconds)
+              raise RuntimeError(f"Gemini request failed: {last_error}")
+          
+          feeds = [
+              ("BBC World", "https://feeds.bbci.co.uk/news/world/rss.xml"),
+              ("BBC UK", "https://feeds.bbci.co.uk/news/uk/rss.xml"),
+              ("The Guardian World", "https://www.theguardian.com/world/rss"),
+              ("The Guardian Technology", "https://www.theguardian.com/technology/rss"),
+              ("NPR World", "https://feeds.npr.org/1004/rss.xml"),
+              ("Al Jazeera News", "https://www.aljazeera.com/xml/rss/all.xml"),
+          ]
+          from datetime import datetime, timezone, timedelta
+          from email.utils import parsedate_to_datetime
+          import xml.etree.ElementTree as ET
+          from html.parser import HTMLParser
+          from urllib.parse import quote
+          
+          class TrendTableParser(HTMLParser):
+              def __init__(self):
+                  super().__init__(convert_charrefs=True)
+                  self.in_row = False
+                  self.in_cell = False
+                  self.cell_parts = []
+                  self.cells = []
+                  self.rows = []
+              def handle_starttag(self, tag, attrs):
+                  tag = tag.lower()
+                  if tag == "tr":
+                      self.in_row = True
+                      self.cells = []
+                  elif tag in ("td", "th") and self.in_row:
+                      self.in_cell = True
+                      self.cell_parts = []
+              def handle_data(self, data):
+                  if self.in_cell:
+                      value = data.strip()
+                      if value:
+                          self.cell_parts.append(value)
+              def handle_endtag(self, tag):
+                  tag = tag.lower()
+                  if tag in ("td", "th") and self.in_cell:
+                      self.cells.append(" ".join(self.cell_parts).strip())
+                      self.in_cell = False
+                      self.cell_parts = []
+                  elif tag == "tr" and self.in_row:
+                      if self.cells:
+                          self.rows.append(self.cells[:])
+                      self.in_row = False
+                      self.cells = []
+          
+          social_topic_signals = []
+          trend_signals = []
+          
+          def add_social_signal(value, source):
+              value = html.unescape(re.sub(r"\s+", " ", value or "")).strip()
+              value = re.sub(r"\s*[-|:]\s*(Reddit|YouTube|TikTok|Instagram|X|Twitter)$", "", value, flags=re.I).strip()
+              if len(value) < 5 or len(value) > 180:
+                  return
+              if value.lower() in {"home", "popular", "trending", "top", "news", "video"}:
+                  return
+              if not any(ch.isalpha() for ch in value):
+                  return
+              if value not in social_topic_signals:
+                  social_topic_signals.append(value)
+                  print(f"Social topic signal ({source}): {value[:120]}")
+          
+          social_sources = [
+              ("Google Trends UK", "https://trends.google.com/trending/rss?geo=GB"),
+              ("Google Trends US", "https://trends.google.com/trending/rss?geo=US"),
+          ]
+          for source_name, source_url in social_sources:
+              try:
+                  trend_response = requests.get(
+                      source_url,
+                      headers={"User-Agent": "Mozilla/5.0 (compatible; SignalBrief/1.0)"},
+                      timeout=18
+                  )
+                  trend_response.raise_for_status()
+                  root = ET.fromstring(trend_response.content)
+                  found = 0
+                  for entry in root.findall(".//item")[:30]:
+                      title_node = entry.find("title")
+                      if title_node is not None and title_node.text:
+                          add_social_signal(title_node.text, source_name)
+                          found += 1
+                  print(f"Loaded {found} search-trend signals from {source_name}.")
+              except Exception as error:
+                  print(f"Trend source unavailable ({source_name}): {error}")
+          
+          try:
+              reddit_response = requests.get(
+                  "https://www.reddit.com/r/popular/hot.json?limit=30",
+                  headers={"User-Agent": "SignalBrief/1.0 (current affairs topic research)"},
+                  timeout=18
+              )
+              reddit_response.raise_for_status()
+              reddit_posts = reddit_response.json().get("data", {}).get("children", [])
+              for post in reddit_posts:
+                  data = post.get("data", {})
+                  title = data.get("title", "")
+                  subreddit = data.get("subreddit", "")
+                  if subreddit.lower() in {"memes", "funny", "askreddit", "gaming", "music", "videos", "aww"}:
+                      continue
+                  if title:
+                      add_social_signal(title, "Reddit popular / " + subreddit)
+              print(f"Loaded social discussion signals from {len(reddit_posts)} Reddit popular posts.")
+          except Exception as error:
+              print(f"Social source unavailable (Reddit popular): {error}")
+          
+          # Discover major non-political stories people are discussing online.
+          # These searches are leads, not proof that a topic is trending.
+          topic_searches = [
+              "viral internet mystery claim fact check evidence social media when:7d",
+              "major online conspiracy claim investigation fact check when:7d",
+              "celebrity scandal controversy investigation court documents when:7d",
+              "high profile case viral claims evidence fact check when:7d",
+              "Epstein alive claim fact check evidence social media when:30d",
+              "Bohemian Grove claims investigation evidence fact check when:30d",
+              "Diddy online claims misinformation fact check when:30d",
+              "viral celebrity controversy misinformation investigation when:7d",
+          ]
+          
+          def is_political_topic(value):
+              text_value = value.lower()
+              # Explicitly keep the user's requested subject areas eligible.
+              if any(term in text_value for term in ("epstein", "sean combs", "diddy", "bohemian grove")):
+                  return False
+              political_patterns = [
+                  r"\belection(s)?\b", r"\belectoral\b", r"\bpresident(ial)?\b",
+                  r"\bprime minister\b", r"\bparliament(ary)?\b", r"\bcongress(ional)?\b",
+                  r"\bsenate\b", r"\bcongressman\b", r"\bgovernment\b", r"\bminister(s)?\b",
+                  r"\bpolitic(s|al|ian|ians)?\b", r"\bpolitical party\b", r"\bcampaign trail\b",
+                  r"\bvoting\b", r"\bvote(s|d)?\b", r"\bballot(s)?\b", r"\bpolicy debate\b",
+                  r"\bwhite house\b", r"\bdowning street\b", r"\bgeopolitic(s|al)?\b",
+                  r"\bceasefire talks\b", r"\bforeign minister\b", r"\bparliamentary vote\b",
+              ]
+              return any(re.search(pattern, text_value) for pattern in political_patterns)
+          
+          investigative_signal_terms = (
+              "epstein", "diddy", "sean combs", "bohemian grove", "scandal", "conspiracy",
+              "mystery", "fact check", "fact-check", "viral", "controversy", "allegation",
+              "lawsuit", "court", "documents", "leaked", "missing", "alive", "dead",
+              "disappearance", "unsolved", "cover-up", "hoax", "deepfake", "exposed",
+              "investigation", "internet", "celebrity", "influencer", "youtuber", "streamer",
+              "cult", "secret", "hidden", "documentary", "fraud", "case files"
+          )
+          signal_candidates = [
+              signal for signal in social_topic_signals
+              if not is_political_topic(signal)
+              and any(term in signal.lower() for term in investigative_signal_terms)
+              and not any(term in signal.lower() for term in (
+                  "official trailer", "music video", "official video", "new song",
+                  "new album", "minecraft", "gameplay", "reaction compilation",
+                  "fixtures", "premier league", "football", "fc ", "nascar", "snowfall totals",
+                  "tour dates", "transfer news"
+              ))
+          ]
+          topic_searches.extend(
+              signal + " controversy mystery claims evidence social media when:7d"
+              for signal in signal_candidates[:8]
+          )
+          
+          now = datetime.now(timezone.utc)
+          feeds = [
+              ("BBC World", "https://feeds.bbci.co.uk/news/world/rss.xml"),
+              ("BBC UK", "https://feeds.bbci.co.uk/news/uk/rss.xml"),
+              ("The Guardian World", "https://www.theguardian.com/world/rss"),
+              ("The Guardian Technology", "https://www.theguardian.com/technology/rss"),
+              ("NPR World", "https://feeds.npr.org/1004/rss.xml"),
+              ("Al Jazeera News", "https://www.aljazeera.com/xml/rss/all.xml"),
+          ]
+          for search_query in topic_searches[:18]:
+              feeds.append((
+                  "Social topic research: " + search_query.replace(" when:7d", "")[:85],
+                  "https://news.google.com/rss/search?q=" + quote(search_query) + "&hl=en-GB&gl=GB&ceid=GB:en"
+              ))
+          news_items = []
+          for source_name, feed_url in feeds:
+              try:
+                  feed_response = requests.get(
+                      feed_url,
+                      headers={"User-Agent": "SignalBrief/1.0 (current affairs research)"},
+                      timeout=20
+                  )
+                  feed_response.raise_for_status()
+                  root = ET.fromstring(feed_response.content)
+                  entries = root.findall(".//item")
+                  if not entries:
+                      entries = [node for node in root.iter() if node.tag.endswith("entry")]
+                  for entry in entries:
+                      def node_text(names):
+                          for node in entry.iter():
+                              if node.tag.split("}")[-1].lower() in names and node.text:
+                                  return node.text.strip()
+                          return ""
+                      headline = node_text({"title"})
+                      summary = node_text({"description", "summary", "encoded"})
+                      link = ""
+                      for node in entry.iter():
+                          if node.tag.split("}")[-1].lower() == "link":
+                              link = (node.attrib.get("href") or node.text or "").strip()
+                              if link:
+                                  break
+                      published = node_text({"pubdate", "published", "updated", "date"})
+                      try:
+                          published_at = parsedate_to_datetime(published)
+                          if published_at.tzinfo is None:
+                              published_at = published_at.replace(tzinfo=timezone.utc)
+                          published_at = published_at.astimezone(timezone.utc)
+                      except Exception:
+                          try:
+                              published_at = datetime.fromisoformat(published.replace("Z", "+00:00"))
+                              if published_at.tzinfo is None:
+                                  published_at = published_at.replace(tzinfo=timezone.utc)
+                              published_at = published_at.astimezone(timezone.utc)
+                          except Exception:
+                              published_at = now - timedelta(hours=12)
+                      summary = re.sub(r"<[^>]+>", " ", summary)
+                      summary = html.unescape(re.sub(r"\s+", " ", summary)).strip()
+                      if headline and link.startswith("http") and published_at >= now - timedelta(days=30):
+                          news_items.append({
+                              "source": source_name,
+                              "headline": headline,
+                              "summary": summary[:900],
+                              "url": link,
+                              "published": published_at.isoformat(),
+                              "published_dt": published_at,
+                          })
+                  print(f"Loaded current headlines from {source_name}.")
+              except Exception as error:
+                  print(f"News feed unavailable ({source_name}): {error}")
+          
+          unique_items = {}
+          for item in news_items:
+              key_title = re.sub(r"[^a-z0-9 ]", "", item["headline"].lower())
+              unique_items[(item["source"], key_title)] = item
+          news_items = sorted(unique_items.values(), key=lambda item: item["published_dt"], reverse=True)
+          if not news_items:
+              raise SystemExit("No current news feeds were available. Rerun the workflow later.")
+          
+          def headline_tokens(value):
+              ignored = {"the", "and", "for", "with", "from", "that", "this", "says", "after", "over", "into", "amid", "what", "why", "how", "its", "their", "has", "have", "are", "was", "were"}
+              return {word for word in re.findall(r"[a-z0-9]+", value.lower()) if len(word) > 2 and word not in ignored}
+          
+          investigative_terms = (
+              "epstein", "diddy", "sean combs", "bohemian grove", "conspiracy",
+              "mystery", "fact check", "fact-check", "viral claim", "misinformation",
+              "scandal", "controversy", "investigation", "unsealed", "court documents",
+              "leaked", "files", "cover-up", "alive", "missing", "debunked", "myth",
+              "rumour", "rumor", "allegation", "evidence", "secret", "hidden", "hoax",
+              "deepfake", "fraud", "lawsuit", "cult", "internet theory", "social media claim"
+          )
+          routine_entertainment_terms = (
+              "official trailer", "new trailer", "music video", "official video",
+              "new single", "new album", "album release", "release date", "teaser trailer",
+              "box office", "episode recap", "season premiere"
+          )
+          
+          def investigative_relevance(item):
+              combined = (item["headline"] + " " + item["summary"]).lower()
+              score = sum(3 for term in investigative_terms if term in combined)
+              if any(term in combined for term in ("epstein", "diddy", "sean combs", "bohemian grove")):
+                  score += 5
+              if any(term in combined for term in routine_entertainment_terms):
+                  score -= 7
+              return score
+          
+          for item in news_items:
+              own = headline_tokens(item["headline"] + " " + item["summary"])
+              corroborating = []
+              for other in news_items:
+                  if other is item or other["source"] == item["source"]:
+                      continue
+                  other_tokens = headline_tokens(other["headline"] + " " + other["summary"])
+                  overlap = len(own & other_tokens) / max(1, len(own | other_tokens))
+                  if overlap >= 0.22:
+                      corroborating.append(other)
+              item["corroborating"] = corroborating
+              item["story_score"] = len({other["source"] for other in corroborating})
+              item["investigative_relevance"] = investigative_relevance(item)
+          
+          # Avoid repeating topics already produced by this workflow. The history file
+          # is committed only after a successful upload, and starts with the user's
+          # existing reptilian-claim video so it is never selected again.
+          history_path = Path("topic-history.json")
+          try:
+              history_data = json.loads(history_path.read_text(encoding="utf-8")) if history_path.exists() else {"topics": []}
+          except Exception:
+              history_data = {"topics": []}
+          previous_topics = [str(value) for value in history_data.get("topics", [])]
+          # Seed the known earlier story: the original upload predates persisted history.
+          previous_topics.append("Are U.S. Troops Fighting Reptilians? Investigating the Viral Fake Image")
+          previous_topics.append("Fact Check: FAKE Image Of U.S. Troops Shooting 'Reptilians' Is NOT Real Photo - Lead Stories")
+
+          def topic_tokens(value):
+              ignored = {"the", "and", "for", "with", "from", "that", "this", "are", "was", "were", "what", "why", "how", "into", "about", "viral", "video", "investigating"}
+              return {word for word in re.findall(r"[a-z0-9]+", str(value).lower()) if len(word) > 2 and word not in ignored}
+
+          def already_covered(item):
+              candidate = topic_tokens(item["headline"] + " " + item.get("summary", ""))
+              headline = topic_tokens(item["headline"])
+              for previous in previous_topics:
+                  old = topic_tokens(previous)
+                  if not old or not headline:
+                      continue
+                  overlap = len(headline & old) / max(1, len(headline | old))
+                  containment = len(headline & old) / max(1, min(len(headline), len(old)))
+                  if overlap >= 0.42 or containment >= 0.72:
+                      print("Skipping previously covered topic: " + item["headline"] + " (matches history: " + previous + ")")
+                      return True
+              return False
+
+          news_items = [item for item in news_items if not already_covered(item)]
+          if not news_items:
+              raise SystemExit("All discovered stories match previously uploaded topics. Rerun later for fresh topics.")
+
+          social_research_items = [
+              item for item in news_items
+              if item["source"].startswith("Social topic research:")
+              and not is_political_topic(item["headline"] + " " + item["summary"])
+              and item["investigative_relevance"] >= 3
+          ]
+          
+          # General feeds can corroborate a chosen story, but should not cause
+          # the channel to drift into routine politics or government coverage.
+          non_political_items = [
+              item for item in news_items
+              if not is_political_topic(item["headline"] + " " + item["summary"])
+          ]
+          if not non_political_items:
+              raise SystemExit("No suitable recent non-political story had accessible reporting. Rerun later.")
+          
+          if social_research_items:
+              selected_item = max(
+                  social_research_items,
+                  key=lambda item: (
+                      item["story_score"],
+                      item["investigative_relevance"],
+                      item["published_dt"] >= now - timedelta(hours=24),
+                      item["published_dt"]
+                  )
+              )
+              print("Prioritising an investigative internet-culture story with recent reporting: " + selected_item["headline"])
+          else:
+              eligible_deep_dive_items = [
+                  item for item in non_political_items
+                  if item["investigative_relevance"] >= 3
+              ]
+              if not eligible_deep_dive_items:
+                  raise SystemExit(
+                      "No suitable investigative story about a major online controversy, mystery, "
+                      "scandal or disputed viral claim has enough recent reporting. The workflow will "
+                      "stop rather than create an unrelated routine news video. Rerun later."
+                  )
+              selected_item = max(
+                  eligible_deep_dive_items,
+                  key=lambda item: (
+                      item["story_score"],
+                      item["investigative_relevance"],
+                      item["published_dt"] >= now - timedelta(hours=24),
+                      item["published_dt"]
+                  )
+              )
+              print("Selected the strongest supported investigative story: " + selected_item["headline"])
+          related_items = [selected_item] + selected_item["corroborating"]
+          related_items = sorted(related_items, key=lambda item: item["published_dt"], reverse=True)[:6]
+          topic = selected_item["headline"]
+          
+          class ArticleParser(HTMLParser):
+              def __init__(self):
+                  super().__init__(convert_charrefs=True)
+                  self.in_paragraph = False
+                  self.paragraph_parts = []
+                  self.paragraphs = []
+                  self.meta_description = ""
+              def handle_starttag(self, tag, attrs):
+                  attributes = dict(attrs)
+                  if tag.lower() == "p":
+                      self.in_paragraph = True
+                      self.paragraph_parts = []
+                  if tag.lower() == "meta":
+                      name = (attributes.get("name") or attributes.get("property") or "").lower()
+                      if name in ("description", "og:description", "twitter:description") and not self.meta_description:
+                          self.meta_description = attributes.get("content", "")
+              def handle_data(self, data):
+                  if self.in_paragraph:
+                      value = data.strip()
+                      if value:
+                          self.paragraph_parts.append(value)
+              def handle_endtag(self, tag):
+                  if tag.lower() == "p" and self.in_paragraph:
+                      paragraph = " ".join(self.paragraph_parts).strip()
+                      if len(paragraph) > 35:
+                          self.paragraphs.append(paragraph)
+                      self.in_paragraph = False
+                      self.paragraph_parts = []
+          
+          news_sources = []
+          for item in related_items:
+              article_text = ""
+              try:
+                  article_response = requests.get(
+                      item["url"],
+                      headers={"User-Agent": "SignalBrief/1.0 (current-affairs research)"},
+                      timeout=18
+                  )
+                  article_response.raise_for_status()
+                  parser = ArticleParser()
+                  parser.feed(article_response.text[:1500000])
+                  article_text = " ".join(parser.paragraphs)
+                  if len(article_text) < 250:
+                      article_text = parser.meta_description
+              except Exception as error:
+                  print(f"Could not retrieve full article from {item['source']}; using its RSS summary: {error}")
+              if not article_text:
+                  article_text = item["summary"]
+              article_text = re.sub(r"\s+", " ", html.unescape(article_text)).strip()[:2600]
+              news_sources.append({key: item[key] for key in ("source", "headline", "summary", "url", "published")})
+              news_sources[-1]["article_excerpt"] = article_text
+          
+          (out / "topic.txt").write_text(topic, encoding="utf-8")
+          (out / "news-sources.json").write_text(json.dumps(news_sources, indent=2, ensure_ascii=False), encoding="utf-8")
+          research = "\n\n".join(
+              f"SOURCE: {item['source']}\nPUBLISHED: {item['published']}\nHEADLINE: {item['headline']}\nRSS SUMMARY: {item['summary']}\nARTICLE EXCERPT (when accessible): {item['article_excerpt']}\nURL: {item['url']}"
+              for item in news_sources
+          )
+          
+          def clean_text(value):
+              value = re.sub(r"<[^>]*>", "", str(value or ""))
+              return html.unescape(value).strip()
+
+          social_discussion_items = []
+          discussion_queries = [
+              topic,
+              " ".join(re.findall(r"[a-zA-Z0-9]+", topic)[:5]) + " theory",
+              " ".join(re.findall(r"[a-zA-Z0-9]+", topic)[:5]) + " fact check",
+          ]
+          for discussion_query in discussion_queries:
+              try:
+                  discussion_response = requests.get(
+                      "https://www.reddit.com/search.json",
+                      params={"q": discussion_query, "sort": "relevance", "t": "month", "limit": 8},
+                      headers={"User-Agent": "SignalBrief/1.0 (public discussion research; educational documentary)"},
+                      timeout=18
+                  )
+                  if discussion_response.status_code == 429:
+                      print("Reddit topic search rate-limited; continuing with available public sources.")
+                      time.sleep(5)
+                      continue
+                  discussion_response.raise_for_status()
+                  posts = discussion_response.json().get("data", {}).get("children", [])
+                  for post in posts:
+                      post_data = post.get("data", {})
+                      post_title = clean_text(post_data.get("title", ""))
+                      if not post_title:
+                          continue
+                      record = {
+                          "subreddit": post_data.get("subreddit", "unknown"),
+                          "title": post_title[:300],
+                          "text": clean_text(post_data.get("selftext", ""))[:900],
+                          "score": int(post_data.get("score", 0) or 0),
+                          "comments": int(post_data.get("num_comments", 0) or 0),
+                          "url": "https://www.reddit.com" + post_data.get("permalink", "")
+                      }
+                      if record["url"] and not any(existing["url"] == record["url"] for existing in social_discussion_items):
+                          social_discussion_items.append(record)
+                  time.sleep(2)
+              except Exception as error:
+                  print(f"Could not retrieve public Reddit discussion for '{discussion_query}': {error}")
+          
+          social_discussion_items.sort(key=lambda item: (item["comments"], item["score"]), reverse=True)
+          discussion_context = "\n\n".join(
+              f"PUBLIC DISCUSSION LEAD (not proof): r/{item['subreddit']} | title: {item['title']} | post text: {item['text']} | score: {item['score']} | comments: {item['comments']} | URL: {item['url']}"
+              for item in social_discussion_items[:18]
+          )
+          if discussion_context:
+              research += "\n\nPUBLIC SOCIAL DISCUSSION LEADS — USE ONLY TO IDENTIFY CLAIMS AND MISCONCEPTIONS, NEVER AS EVIDENCE OF FACT:\n" + discussion_context
+          else:
+              research += "\n\nNo topic-specific public Reddit discussion was accessible this run. Do not invent what people online are saying."
+          (out / "social-discussions.json").write_text(
+              json.dumps(social_discussion_items[:18], indent=2, ensure_ascii=False),
+              encoding="utf-8"
+          )
+          
+          prompt = f"""You are the lead investigative video essay writer for SIGNAL BRIEF. Write like a sharp, modern YouTube documentary creator who is curious, sceptical, clear and engaging—not like a newsreader reading headlines.
+          Selected research lead: {topic}
+          Current UTC date: {now.strftime('%Y-%m-%d')}
+          
+          SOCIAL DISCUSSION SIGNALS (Google Trends and public Reddit discussions; discovery clues only, not evidence of factual claims):
+          {json.dumps(social_topic_signals[:35], ensure_ascii=False)}
+          
+          SOURCE MATERIAL (recent news reports, dates, summaries, article excerpts and URLs; includes searches around high-discussion topics such as Epstein-related documents, the Diddy case, Bohemian Grove, and other current online controversies):
+          {research}
+          
+          Choose an investigative QUESTION, not a routine news update. The channel covers major internet mysteries, high-profile scandals, celebrity/influencer controversies, public-record mysteries, viral claims, alleged cover-ups, strange online theories, and misconceptions that deserve a proper evidence-led deep dive. Example framing: “Is Jeffrey Epstein Still Alive? Investigating the Claims” is a better format than a generic headline about a new court update. Epstein, Diddy and Bohemian Grove are examples of subject areas, not automatic choices. Pick them only when the supplied signals and evidence make a meaningful investigation possible. Avoid politics, elections, government policy, and routine daily headlines. Do not pick a random music/video release merely because it is trending. Use social posts to identify what people are asking or getting wrong, never as proof. If no suitable deep-dive topic has credible sources, stop rather than publish an unrelated story.
+          
+          The narration MUST begin with this exact sentence, replacing the bracketed topic with the selected topic: “I am Signal Brief, and I will be discussing {topic}.” Immediately after that one-sentence identification, launch into the single most gripping, specific, evidence-grounded hook in the investigation. Do not add greetings, a long intro, or any other channel introduction. The hook should make the viewer want the answer without presenting an unproven claim as fact.
+          
+          Write 1,000–1,300 spoken words in natural British English, aiming for about 1,150. Structure the narration like a high-retention YouTube investigation:
+          1. After the required one-sentence channel identification, immediately open with the most gripping question or verified detail; no generic intro.
+          2. Explain the origin of the claim or mystery and why it spread online.
+          3. Build a clear timeline of the key events and the strongest available evidence.
+          4. Examine the main arguments people use to support the popular theory, one by one, and explain what the evidence actually shows.
+          5. Investigate common misconceptions, misleading clips/images, missing context, and claims that cannot be verified.
+          6. Present the strongest counter-evidence and plausible alternative explanations fairly.
+          7. Separate confirmed facts, reasonable inferences, unresolved questions, and unsupported speculation.
+          8. End with a clear evidence-based verdict and what new evidence would genuinely change the assessment.
+          Keep the pace conversational, curious and analytical. Use mini-reveals and transitions to maintain interest, but do not manufacture suspense or pretend weak evidence is a breakthrough.
+          
+          Research and accuracy rules:
+          - Use only claims supported by the supplied source material or clearly labelled, well-established background context.
+          - Treat social media theories as claims to investigate, not facts. Explain the strongest version of the claim before assessing it.
+          - Use the supplied public discussion leads to identify the most common questions, arguments and misconceptions; do not describe a claim as common or widespread unless the supplied discussion signals actually support that description.
+          - For each major online claim, explain why people find it convincing, what evidence they point to, what context is missing, and whether the available evidence supports it. If the discussion sample is weak or unrepresentative, say so.
+          - Identify the original source of key images, videos, documents or quotes where supplied sources allow it; distinguish primary records from commentary about them.
+          - Never say you personally browsed a platform, watched a video, or inspected a document unless the source material actually provides it.
+          - Attribute allegations, official statements and disputed claims to the source or named speaker.
+          - Do not invent quotes, numbers, dates, eyewitness details, motives, or future outcomes.
+          - If only one source covers a claim, explicitly frame it as that outlet's reporting rather than
+            independently confirmed fact. Do not claim independent corroboration unless the supplied
+            sources genuinely support the same event.
+          - If source summaries disagree or details are missing, state that clearly instead of guessing.
+          - Avoid sensationalism, partisan advocacy, graphic detail, and presenting speculation as fact.
+          - Do not use generic filler or a long channel introduction. Keep it specific to the central question and useful to viewers.
+          - Do not repeat the same fact to pad the word count. If evidence is limited, explain the limits rather than inventing detail.
+          - End with a direct, nuanced answer to the opening question and identify what evidence would change that answer.
+          - Return only spoken narration. No title, headings, bullet points, citations, stage directions,
+            or production notes."""
+          
+          response = gemini_post(
+              "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent",
+              headers={"x-goog-api-key": key},
+              json={
+                  "contents": [{"parts": [{"text": prompt}]}],
+                  "generationConfig": {
+                      "temperature": 0.7,
+                      "maxOutputTokens": 3400
+                  }
+              },
+              timeout=(20, 300)
+          )
+          response.raise_for_status()
+          data = response.json()
+          script = "".join(
+              part.get("text", "")
+              for part in data["candidates"][0]["content"]["parts"]
+          ).strip()
+          
+          if not script:
+              raise SystemExit("Script generation returned empty text.")
+          
+          word_count = len(script.split())
+          expansion_attempt = 0
+          while word_count < 1050 and expansion_attempt < 3:
+              expansion_attempt += 1
+              print(
+                  f"Narration is {word_count} words; asking Gemini to deepen the investigation "
+                  f"(expansion attempt {expansion_attempt}/3)."
+              )
+              expansion_prompt = f"""You are the lead writer for SIGNAL BRIEF, a modern investigative YouTube documentary channel. The current narration is {word_count} words. Produce a stronger COMPLETE version of 1,050–1,300 spoken words in natural British English. This is a substantive investigation, not a news bulletin.
+          
+              Preserve all supported facts and use only the supplied research or facts already present in the narration. Do not invent events, quotes, dates, numbers, sources, motives, social-media reactions, or evidence. Add meaningful depth: trace the origin and timeline of the claim, explain the strongest arguments supporters make, assess each argument against the available evidence, identify common misconceptions and missing context, compare reliable sources, and clearly state what remains unknown. Do not repeat paragraphs or pad with generic commentary. If evidence is limited, explain that limitation in useful detail. Return the entire finished narration only, without a title, headings, bullets, citations or production notes.
+          
+              SOURCE MATERIAL:
+              {research}
+          
+              SOCIAL DISCUSSION MATERIAL:
+              {research if not social_discussion_items else json.dumps(social_discussion_items[:12], ensure_ascii=False)}
+          
+              CURRENT NARRATION:
+              {script}"""
+              try:
+                  expansion_response = gemini_post(
+                      "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent",
+                      headers={"x-goog-api-key": key},
+                      json={
+                          "contents": [{"parts": [{"text": expansion_prompt}]}],
+                          "generationConfig": {"temperature": 0.45, "maxOutputTokens": 3400}
+                      },
+                      timeout=(20, 300)
+                  )
+                  expansion_response.raise_for_status()
+                  expansion_data = expansion_response.json()
+                  expanded_script = "".join(
+                      part.get("text", "")
+                      for part in expansion_data["candidates"][0]["content"]["parts"]
+                  ).strip()
+                  expanded_count = len(expanded_script.split())
+                  if expanded_script and expanded_count > word_count:
+                      script = expanded_script
+                      word_count = expanded_count
+                      print(f"Expanded narration now contains {word_count} words.")
+                  else:
+                      print("Expansion did not increase the word count; keeping the better existing draft.")
+              except Exception as error:
+                  print(f"Narration expansion attempt {expansion_attempt} failed: {error}")
+          
+          if word_count < 800:
+              raise SystemExit(
+                  f"Narration generation failed: only {word_count} words after expansion attempts; "
+                  "at least 800 are required. Rerun the workflow to try again."
+              )
+          if word_count < 1000:
+              print(
+                  f"Warning: final narration is {word_count} words after three expansion attempts. "
+                  "Continuing because the draft is substantial and the evidence must not be padded."
+              )
+          
+          required_intro = f"I am Signal Brief, and I will be discussing {topic}."
+          script = re.sub(r"^\s*I am Signal Brief, and I will be discussing [^.]+\.\s*", "", script, flags=re.IGNORECASE)
+          script = required_intro + "\n\n" + script.lstrip()
+          word_count = len(script.split())
+          (out / "script.txt").write_text(script, encoding="utf-8")
+          print(f"Investigative narration generated with required Signal Brief opening: {word_count} words.")
+          
+          title_prompt = f"""Create one accurate, compelling YouTube title for this SIGNAL BRIEF investigative video essay.
+          Prefer a clear question followed by an investigation framing, such as 'Is [claim] True? Investigating the Evidence' or 'What Really Happened to [subject]?'. Do not copy a news headline, do not use ALL CAPS, and do not imply a claim is true if the script investigates it. Make it intriguing but not misleading, ideally 45–75 characters and no more than 95 characters. Return only the title, with no quotation marks or explanation.
+          Research lead: {topic}
+          Narration: {script[:9000]}"""
+          title_response = gemini_post(
+              "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent",
+              headers={"x-goog-api-key": key},
+              json={
+                  "contents": [{"parts": [{"text": title_prompt}]}],
+                  "generationConfig": {"temperature": 0.45, "maxOutputTokens": 120}
+              },
+              timeout=(20, 300)
+          )
+          title_response.raise_for_status()
+          title_data = title_response.json()
+          video_title = "".join(
+              part.get("text", "")
+              for part in title_data["candidates"][0]["content"]["parts"]
+          ).strip().strip('"“”')
+          video_title = re.sub(r"\s+", " ", video_title).strip()
+          if not video_title or len(video_title) > 95:
+              video_title = "The Evidence Behind " + topic
+          (out / "video-title.txt").write_text(video_title, encoding="utf-8")
+          print("Generated investigative title: " + video_title)
+          
+          payload = {
+              "contents": [{"parts": [{"text": script}]}],
+              "generationConfig": {
+                  "responseModalities": ["AUDIO"],
+                  "speechConfig": {
+                      "voiceConfig": {
+                          "prebuiltVoiceConfig": {
+                              "voiceName": "Kore"
+                          }
+                      }
+                  }
+              }
+          }
+          
+          response = gemini_post(
+              "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-tts:generateContent",
+              headers={
+                  "x-goog-api-key": key,
+                  "Content-Type": "application/json"
+              },
+              json=payload,
+              timeout=(20, 300)
+          )
+          
+          if not response.ok:
+              print(response.text[:2000])
+              response.raise_for_status()
+          
+          audio = None
+          mime_type = ""
+          for part in response.json().get("candidates", [{}])[0].get("content", {}).get("parts", []):
+              inline_data = part.get("inlineData") or part.get("inline_data") or {}
+              if inline_data.get("data"):
+                  audio = inline_data["data"]
+                  mime_type = inline_data.get("mimeType") or inline_data.get("mime_type") or ""
+                  break
+          
+          if not audio:
+              raise SystemExit("No narration audio returned by Gemini TTS.")
+          
+          audio_bytes = base64.b64decode(audio)
+          if audio_bytes.startswith(b"RIFF"):
+              (out / "narration.wav").write_bytes(audio_bytes)
+          else:
+              sample_rate_match = re.search(r"rate=(\d+)", mime_type)
+              sample_rate = int(sample_rate_match.group(1)) if sample_rate_match else 24000
+              with wave.open(str(out / "narration.wav"), "wb") as wav_file:
+                  wav_file.setnchannels(1)
+                  wav_file.setsampwidth(2)
+                  wav_file.setframerate(sample_rate)
+                  wav_file.writeframes(audio_bytes)
+          
+          print("Narration generated.")
+          
+          
+          visual_prompt = f"""You are the visual researcher and editor for a modern, high-quality investigative YouTube documentary for SIGNAL BRIEF.
+          Return ONLY valid JSON:
+          {{"scenes":[{{"index":1,"keyword":"specific subject, not an isolated verb","title":"what the viewer should actually see","visual_subject":"concrete visual subject in plain language","visual_intent":"why this visual fits this exact narration passage","query":"specific photographic search phrase","avoid":"misleading or unrelated visual types"}}]}}
+          Create exactly one visual beat for every narration passage, preserving all indices and order. Read the ENTIRE investigation topic and each passage together before deciding what the image should depict. Understand references, pronouns, irony, metaphors, allegations, and the sentence's actual subject. Never match an image to a single word in isolation.
+          The visual must represent the central SUBJECT or EVIDENCE being discussed in that exact passage. Example: if the investigation discusses a conspiracy theory about a reptilian race allegedly seeking to destroy the world, the word “destroy” does NOT mean search for a burning building. Choose a clearly illustrative reptilian-humanoid/conspiracy-culture visual, the person or source making the claim, or the specific document/post being discussed. Never present a fictional or alleged event as proven fact.
+          Identify the passage's role (claim, person, location, document, timeline, evidence, counterargument, or conclusion), then choose the most informative visual for that role. Prefer directly relevant people, named places, real documents, screenshots or public records when available. Use illustrations only when suitable to explain a theory or abstract idea. Do not use generic disaster, fire, courtroom, city, or “mysterious” stock images just because a verb or mood suggests them. Never imply a generic image depicts the actual event.
+          The keyword, visual_subject, and query must describe the SAME thing. The query must be a short, FINDABLE image-search phrase (usually 2–5 words), not a description of a hypothetical website screen or made-up screenshot. Prefer subjects that really have reusable photos: U.S. military training, journalists working, an ordinary smartphone, a television newsroom, computer image editing, computer displays, archive files, and genuine named people or places. Do NOT search for the exact viral fake image as if it were verified evidence. A REAL, clearly illustrative shot of the investigation's subject is better than an impossible "computer showing the precise article" request. For abstract passages, reuse a recurring visual theme (reporting, phones, investigations) rather than inventing a specific document or interface. Make sure visual subjects vary across the film. Image beats must be at least 1.0 second apart; timings are based on narration audio. Current investigation: {topic}
+          
+          PASSAGES:
+          """
+          script_words = script.split()
+          chunk_size = 28  # Fewer, better-researched images (about 35-45 for a 6-minute film).
+          scene_count = (len(script_words) + chunk_size - 1) // chunk_size
+          passages = []
+          for index in range(scene_count):
+              passage_words = script_words[index * chunk_size:(index + 1) * chunk_size]
+              if passage_words:
+                  passages.append({
+                      "index": index + 1,
+                      "text": " ".join(passage_words)
+                  })
+          
+          visual_input = visual_prompt + json.dumps(passages, ensure_ascii=False)
+          visual_response = gemini_post(
+              "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent",
+              headers={"x-goog-api-key": key},
+              json={
+                  "contents": [{"parts": [{"text": visual_input}]}],
+                  "generationConfig": {
+                      "temperature": 0.2,
+                      "maxOutputTokens": 7000,
+                      "responseMimeType": "application/json"
+                  }
+              },
+              timeout=(20, 300)
+          )
+          visual_response.raise_for_status()
+          visual_data = visual_response.json()
+          visual_text = "".join(
+              part.get("text", "")
+              for part in visual_data["candidates"][0]["content"]["parts"]
+          ).strip()
+          visual_text = re.sub(r"^```(?:json)?\s*|\s*```$", "", visual_text)
+          try:
+              visual_scenes = json.loads(visual_text).get("scenes", [])
+          except json.JSONDecodeError:
+              visual_scenes = []
+          
+          scene_by_index = {
+              int(item.get("index", 0)): item
+              for item in visual_scenes
+              if str(item.get("index", "")).isdigit()
+          }
+          
+          def clean_text(value):
+              value = re.sub(r"<[^>]*>", "", str(value or ""))
+              return html.unescape(value).strip()
+          
+          def tokens(value):
+              ignored = {
+                  "the", "and", "for", "with", "from", "that", "this", "into",
+                  "near", "about", "during", "after", "before", "image", "photo",
+                  "historic", "historical", "documentary", "scene", "view",
+                  "official", "trailer", "video", "videos", "news", "current",
+                  "report", "reports", "reporting", "unveils", "announces",
+                  "reveals", "firstshowing", "first", "latest", "new", "newly",
+                  "around", "across", "actually", "known", "story", "stories",
+                  "audiences", "people", "content", "channel", "channels"
+              }
+              return {
+                  word for word in re.findall(r"[a-z0-9]+", value.lower())
+                  if len(word) > 2 and word not in ignored
+              }
+          
+          def make_context_card(path, title, passage):
+              from PIL import ImageDraw, ImageFont
+              canvas = Image.new("RGB", (1920, 1080), (13, 16, 22))
+              draw = ImageDraw.Draw(canvas)
+              for y in range(0, 1080, 4):
+                  shade = int(18 + 16 * y / 1080)
+                  draw.line((0, y, 1920, y), fill=(shade, shade + 2, shade + 8), width=4)
+              draw.rectangle((120, 130, 1800, 950), outline=(85, 105, 128), width=3)
+              try:
+                  heading_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 66)
+                  body_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 30)
+              except OSError:
+                  heading_font = ImageFont.load_default()
+                  body_font = ImageFont.load_default()
+              draw.text((180, 205), "SIGNAL BRIEF INVESTIGATION", font=body_font, fill=(155, 177, 201))
+              title_lines = []
+              current = ""
+              for word in (title or "Documentary context").split():
+                  candidate = (current + " " + word).strip()
+                  if len(candidate) > 30:
+                      title_lines.append(current)
+                      current = word
+                  else:
+                      current = candidate
+              if current:
+                  title_lines.append(current)
+              y = 330
+              for line in title_lines[:4]:
+                  draw.text((180, y), line, font=heading_font, fill=(240, 243, 248))
+                  y += 88
+              excerpt = " ".join(passage.split()[:26])
+              if len(excerpt) > 180:
+                  excerpt = excerpt[:177].rsplit(" ", 1)[0] + "..."
+              draw.text((180, 790), excerpt, font=body_font, fill=(174, 185, 199))
+              canvas.save(path, quality=92)
+          
+          commons_last_request = 0.0
+          commons_search_cache = {}
+          
+          def commons_image_candidates(search_query):
+              global commons_last_request
+              cache_key = search_query.casefold().strip()
+              if cache_key in commons_search_cache:
+                  return commons_search_cache[cache_key]
+              params = {
+                  "action": "query",
+                  "generator": "search",
+                  "gsrsearch": search_query,
+                  "gsrnamespace": 6,
+                  "gsrlimit": 18,
+                  "prop": "imageinfo",
+                  "iiprop": "url|extmetadata",
+                  "iiurlwidth": 1920,
+                  "format": "json"
+              }
+              headers = {
+                  "User-Agent": "SignalBrief/1.1 (automated current-affairs video; Wikimedia Commons attribution enabled)",
+                  "Accept": "application/json"
+              }
+              response = None
+              for attempt in range(5):
+                  wait_for_slot = 3.0 - (time.monotonic() - commons_last_request)
+                  if wait_for_slot > 0:
+                      time.sleep(wait_for_slot)
+                  try:
+                      response = requests.get(
+                          "https://commons.wikimedia.org/w/api.php",
+                          params=params,
+                          headers=headers,
+                          timeout=(15, 35)
+                      )
+                      commons_last_request = time.monotonic()
+                      if response.status_code == 429 or response.status_code in (500, 502, 503, 504):
+                          retry_after = response.headers.get("Retry-After", "")
+                          try:
+                              delay = min(60, max(10, int(retry_after))) if retry_after else min(60, 10 * (attempt + 1))
+                          except ValueError:
+                              delay = min(60, 10 * (attempt + 1))
+                          if attempt == 4:
+                              response.raise_for_status()
+                          print(f"Wikimedia rate/server limit for '{search_query}'; waiting {delay}s before retry {attempt + 2}/5.")
+                          time.sleep(delay)
+                          continue
+                      response.raise_for_status()
+                      break
+                  except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as error:
+                      if attempt == 4:
+                          raise
+                      delay = min(45, 8 * (attempt + 1))
+                      print(f"Wikimedia request failed for '{search_query}': {error}; waiting {delay}s before retry.")
+                      time.sleep(delay)
+              if response is None:
+                  raise RuntimeError(f"No response from Wikimedia Commons for '{search_query}'.")
+              pages = response.json().get("query", {}).get("pages", {}).values()
+              query_tokens = tokens(search_query)
+              ranked = []
+              for page in pages:
+                  title = page.get("title", "")
+                  info_list = page.get("imageinfo", [])
+                  if not info_list:
+                      continue
+                  info = info_list[0]
+                  mime = str(info.get("mime", "")).lower()
+                  if mime and not mime.startswith("image/"):
+                      continue
+                  if any(title.lower().endswith(ext) for ext in (".pdf", ".svg", ".djvu", ".ogg", ".ogv", ".webm")):
+                      continue
+                  metadata = info.get("extmetadata", {})
+                  description = clean_text(metadata.get("ImageDescription", {}).get("value", ""))
+                  categories = clean_text(metadata.get("Categories", {}).get("value", ""))
+                  searchable = title + " " + description + " " + categories
+                  match_tokens = tokens(searchable)
+                  overlap = len(query_tokens & match_tokens)
+                  score = overlap / max(1, len(query_tokens))
+                  if overlap < 2 or score < 0.34:
+                      continue
+                  license_name = clean_text(metadata.get("LicenseShortName", {}).get("value", ""))
+                  copyright_status = clean_text(metadata.get("Copyrighted", {}).get("value", "")).lower()
+                  license_lower = license_name.lower()
+                  reusable = (
+                      "cc by" in license_lower
+                      or "cc-by" in license_lower
+                      or "cc_by" in license_lower
+                      or "cc0" in license_lower
+                      or "public domain" in license_lower
+                      or "public domain" in copyright_status
+                      or copyright_status == "false"
+                  )
+                  if not reusable:
+                      continue
+                  image_url = info.get("thumburl") or info.get("url", "")
+                  if not image_url.startswith("https://"):
+                      continue
+                  ranked.append((score, {
+                      "url": image_url,
+                      "title": title,
+                      "creator": clean_text(metadata.get("Artist", {}).get("value", "")),
+                      "license": license_name,
+                      "license_url": clean_text(metadata.get("LicenseUrl", {}).get("value", "")),
+                      "foreign_landing_url": f"https://commons.wikimedia.org/?curid={page.get('pageid', '')}",
+                      "attribution": clean_text(
+                          metadata.get("Attribution", {}).get("value", "")
+                          or metadata.get("Credit", {}).get("value", "")
+                          or metadata.get("Artist", {}).get("value", "")
+                      ),
+                      "description": description,
+                      "categories": categories,
+                      "searchable_text": searchable,
+                      "match_score": round(score, 3)
+                  }))
+              ranked.sort(key=lambda pair: pair[0], reverse=True)
+              results = [item for _, item in ranked]
+              commons_search_cache[cache_key] = results
+              return results
+          
+          # Extra searchable sources: Openverse is free; Pexels/Pixabay need optional API keys.
+          # Keep metadata and the original image page URL for crediting in video descriptions.
+          from urllib.parse import quote
+          stock_cache = {}
+
+          def stock_candidate(url, title, creator, licence, licence_url, page_url, description, source, score=0.4):
+              return {
+                  "url": str(url or ""),
+                  "title": clean_text(title or source),
+                  "creator": clean_text(creator or ""),
+                  "license": licence,
+                  "license_url": licence_url,
+                  "foreign_landing_url": str(page_url or url or ""),
+                  "attribution": clean_text(creator or source),
+                  "description": clean_text(description or ""),
+                  "categories": "",
+                  "searchable_text": " ".join((str(title or ""), str(description or ""))),
+                  "match_score": score,
+                  "source": source,
+              }
+
+          def openverse_image_candidates(query):
+              try:
+                  response = requests.get(
+                      "https://api.openverse.org/v1/images/",
+                      params={"q": query, "page_size": 12,
+                              "license": "by,by-sa,cc0,pdm", "mature": "false"},
+                      headers={"User-Agent": "SignalBriefVideo/1.3 (image attribution in video description)"},
+                      timeout=20,
+                  )
+                  response.raise_for_status()
+                  results = []
+                  for item in response.json().get("results", []):
+                      if (item.get("license") or "").lower() not in {"by", "by-sa", "cc0", "pdm"}:
+                          continue
+                      url = item.get("url") or item.get("thumbnail")
+                      if not str(url or "").startswith("https://"):
+                          continue
+                      tags = " ".join(
+                          tag.get("name", "") if isinstance(tag, dict) else str(tag)
+                          for tag in (item.get("tags") or [])[:12]
+                      )
+                      results.append(stock_candidate(
+                          url, item.get("title"), item.get("creator"),
+                          "CC " + str(item.get("license") or "").upper(),
+                          item.get("license_url") or "",
+                          item.get("foreign_landing_url") or url,
+                          tags, "openverse", 0.48,
+                      ))
+                  return results
+              except Exception as exc:
+                  print(f"Openverse unavailable for {query!r}: {exc}")
+                  return []
+
+          def pexels_image_candidates(query):
+              if not pexels_key:
+                  return []
+              try:
+                  response = requests.get(
+                      "https://api.pexels.com/v1/search",
+                      params={"query": query, "per_page": 12, "orientation": "landscape"},
+                      headers={"Authorization": pexels_key}, timeout=20,
+                  )
+                  response.raise_for_status()
+                  return [stock_candidate(
+                      (photo.get("src") or {}).get("large") or (photo.get("src") or {}).get("medium"),
+                      photo.get("alt") or query, photo.get("photographer"),
+                      "Pexels License", "https://www.pexels.com/license/",
+                      photo.get("url"), photo.get("alt") or query, "pexels", 0.48,
+                  ) for photo in response.json().get("photos", [])]
+              except Exception as exc:
+                  print(f"Pexels unavailable for {query!r}: {exc}")
+                  return []
+
+          def pixabay_image_candidates(query):
+              if not pixabay_key:
+                  return []
+              try:
+                  response = requests.get(
+                      "https://pixabay.com/api/",
+                      params={"key": pixabay_key, "q": query, "per_page": 12,
+                              "image_type": "photo", "safesearch": "true"},
+                      timeout=20,
+                  )
+                  response.raise_for_status()
+                  return [stock_candidate(
+                      item.get("largeImageURL") or item.get("webformatURL"),
+                      item.get("tags") or query, item.get("user"),
+                      "Pixabay Content License", "https://pixabay.com/service/license-summary/",
+                      item.get("pageURL"), item.get("tags") or query, "pixabay", 0.46,
+                  ) for item in response.json().get("hits", [])]
+              except Exception as exc:
+                  print(f"Pixabay unavailable for {query!r}: {exc}")
+                  return []
+
+          def image_candidates(search_query):
+              cache_key = search_query.strip().lower()
+              if cache_key in stock_cache:
+                  return stock_cache[cache_key]
+              # Pull multiple libraries even if one is rate-limited.
+              results = []
+              for fetch in (commons_image_candidates, openverse_image_candidates,
+                            pexels_image_candidates, pixabay_image_candidates):
+                  try:
+                      results.extend(fetch(search_query))
+                  except Exception as exc:
+                      print(f"Image source {fetch.__name__} unavailable: {exc}")
+              unique = {}
+              for item in results:
+                  url = item.get("foreign_landing_url") or item.get("url")
+                  if item.get("url") and url:
+                      unique.setdefault(url, item)
+              stock_cache[cache_key] = list(unique.values())
+              by_source = {}
+              for item in stock_cache[cache_key]:
+                  source = item.get("source", "wikimedia")
+                  by_source[source] = by_source.get(source, 0) + 1
+              print(f"Image search {search_query!r}: {len(stock_cache[cache_key])} candidates by source {by_source}")
+              return stock_cache[cache_key]
+
+          # Final fallback uses Gemini image generation (requires billing). No fake evidence.
+          def generate_illustration(path, scene_title, visual_subject, passage_text):
+              if not enable_ai_images:
+                  return False
+              from PIL import ImageOps, ImageDraw, ImageFont
+              prompt = (
+                  "Create a landscape 16:9 editorial illustration to accompany a factual documentary. "
+                  "Visualise the subject symbolically and generically, not as a claimed authentic photo or screenshot. "
+                  "Never impersonate real news screenshots, fabricate documents or invent proof of allegations. "
+                  "If named people or real alleged incidents are mentioned, show neutral objects/settings instead. "
+                  "High-quality cinematic editorial illustration, no words, no logos, no watermark. "
+                  f"Investigation: {topic[:160]}. Scene: {scene_title[:150]}. "
+                  f"Subject: {visual_subject[:150]}. Narration: {passage_text[:280]}"
+              )
+              for attempt in range(2):
+                  try:
+                      response = requests.post(
+                          "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite-image:generateContent",
+                          headers={"x-goog-api-key": key, "Content-Type": "application/json"},
+                          json={
+                              "contents": [{"parts": [{"text": prompt}]}],
+                              "generationConfig": {
+                                  "responseModalities": ["IMAGE"],
+                                  "responseFormat": {"image": {"aspectRatio": "16:9"}},
+                              },
+                          },
+                          timeout=(20, 150),
+                      )
+                      if response.status_code == 429 or response.status_code >= 500:
+                          time.sleep(10 * (attempt + 1))
+                          continue
+                      response.raise_for_status()
+                      parts = response.json().get("candidates", [{}])[0].get("content", {}).get("parts", [])
+                      encoded = next(
+                          (part["inlineData"]["data"] for part in parts if part.get("inlineData", {}).get("data")),
+                          None,
+                      )
+                      if not encoded:
+                          print(f"Gemini image returned no image for {scene_title!r}")
+                          return False
+                      generated = Image.open(io.BytesIO(base64.b64decode(encoded))).convert("RGB")
+                      generated = ImageOps.fit(generated, (1920, 1080), method=Image.Resampling.LANCZOS)
+                      draw = ImageDraw.Draw(generated)
+                      font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+                      font = ImageFont.truetype(font_path, 25)
+                      draw.rounded_rectangle((1500, 100, 1870, 165), radius=10, fill=(15, 18, 25))
+                      draw.text((1522, 116), "AI ILLUSTRATION", font=font, fill=(240, 243, 248))
+                      generated.save(path, "JPEG", quality=88)
+                      return True
+                  except Exception as exc:
+                      print(f"Gemini image fallback attempt {attempt + 1} failed: {exc}")
+                      time.sleep(5)
+              return False
+
+          attribution = []
+          scene_manifest = []
+          used_titles = set()
+          
+          def tokens_ignored():
+              return {
+                  "the", "and", "for", "with", "from", "that", "this", "into",
+                  "near", "about", "during", "after", "before", "image", "photo",
+                  "historic", "historical", "documentary", "scene", "view", "official",
+                  "trailer", "video", "videos", "news", "current", "report", "reports",
+                  "reporting", "unveils", "announces", "reveals", "firstshowing", "first",
+                  "latest", "new", "newly", "around", "across", "actually", "known",
+                  "story", "stories", "audiences", "people", "content", "channel", "channels"
+              }
+          
+          def scene_search_queries(search_query, scene_title, visual_subject, keyword):
+              ignored = tokens_ignored()
+              subject_words = [word for word in re.findall(r"[a-z0-9]+", (visual_subject or "").lower()) if word not in ignored]
+              keyword_words = [word for word in re.findall(r"[a-z0-9]+", (keyword or "").lower()) if word not in ignored]
+              title_words = [word for word in re.findall(r"[a-z0-9]+", (scene_title or "").lower()) if word not in ignored]
+              variants = [
+                  search_query,
+                  visual_subject,
+                  scene_title,
+                  " ".join(subject_words[:5]),
+                  " ".join((keyword_words[:3] + subject_words[:3])),
+                  " ".join(title_words[:3] + subject_words[:3]),
+              ]
+              result = []
+              seen = set()
+              for value in variants:
+                  value = re.sub(r"\s+", " ", value or "").strip(" ,.-")
+                  key_value = value.casefold()
+                  if len(tokens(value)) >= 2 and key_value not in seen:
+                      result.append(value)
+                      seen.add(key_value)
+              return result[:2]  # Avoid excessive API calls and rate-limiting.
+          
+          def download_candidate(candidate):
+              request = urllib.request.Request(
+                  candidate["url"],
+                  headers={"User-Agent": "Mozilla/5.0 (compatible; SignalBrief/1.2)"}
+              )
+              with urllib.request.urlopen(request, timeout=25) as image_response:
+                  content_type = image_response.headers.get("Content-Type", "").split(";")[0].lower()
+                  raw = image_response.read(12 * 1024 * 1024 + 1)
+              if content_type not in ("image/jpeg", "image/png", "image/webp") or len(raw) > 12 * 1024 * 1024:
+                  return None
+              image = Image.open(io.BytesIO(raw)).convert("RGB")
+              if image.width < 600 or image.height < 350:
+                  return None
+              image.thumbnail((1600, 1600))
+              buffer = io.BytesIO()
+              image.save(buffer, format="JPEG", quality=86, optimize=True)
+              return buffer.getvalue()
+          
+          def judge_visual_relevance(passage_text, scene_title, visual_subject, candidates):
+              prepared = []
+              for candidate in candidates[:3]:
+                  try:
+                      image_bytes = download_candidate(candidate)
+                      if image_bytes:
+                          prepared.append((candidate, image_bytes))
+                  except Exception as error:
+                      print(f"Could not inspect candidate '{candidate.get('title', '')}': {error}")
+                  time.sleep(1.5)
+              if not prepared:
+                  return None
+              prompt = (
+                  "Inspect the actual image(s) and select a visually interesting, FACTUALLY HONEST supporting visual. "
+                  "A direct photo of the specific documented person/place/object is best, but ordinary relevant documentary B-ROLL "
+                  "(a phone being used during discussion of viral posts, reporters during discussion of fact-checking, "
+                  "soldiers during discussion of the real U.S. military) is ALLOWED as an *illustration*, not as proof "
+                  "of the viral allegation. NEVER claim an illustrative shot is evidence, footage of an alleged event, "
+                  "or a screenshot of a specific claim. Reject irrelevant photos, misleading representation, or text-only screenshots. "
+                  "Choose the best candidate, or 0 if all are truly unrelated. Return JSON with best_candidate, "
+                  "confidence and reason. Indices are 1 to 3; confidence is 0 to 1.\n"
+                  f"Investigation topic: {topic}\nScene title: {scene_title}\nVisual subject: {visual_subject}\nNarration passage: {passage_text}\n"
+              )
+              for index, (candidate, _) in enumerate(prepared, start=1):
+                  prompt += f"\nCandidate {index}: {candidate.get('title','')} — {candidate.get('description','')}"
+              parts = [{"text": prompt}]
+              for _, image_bytes in prepared:
+                  parts.append({"inline_data": {"mime_type": "image/jpeg", "data": base64.b64encode(image_bytes).decode("ascii")}})
+              try:
+                  response = gemini_post(
+                      "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent",
+                      headers={"x-goog-api-key": key},
+                      json={
+                          "contents": [{"parts": parts}],
+                          "generationConfig": {"temperature": 0.1, "maxOutputTokens": 300, "responseMimeType": "application/json"}
+                      },
+                      timeout=(20, 300)
+                  )
+                  response.raise_for_status()
+                  data = response.json()
+                  result_text = "".join(part.get("text", "") for part in data["candidates"][0]["content"]["parts"]).strip()
+                  result_text = re.sub(r"^```(?:json)?\s*|\s*```$", "", result_text)
+                  judgement = json.loads(result_text)
+                  choice = int(judgement.get("best_candidate", 0))
+                  confidence = float(judgement.get("confidence", 0))
+                  reason = clean_text(judgement.get("reason", ""))
+                  print(f"Visual relevance judgement: candidate={choice}, confidence={confidence:.2f}, reason={reason}")
+                  if choice < 1 or choice > len(prepared) or confidence < 0.60:
+                      return None
+                  selected = dict(prepared[choice - 1][0])
+                  selected["_image_bytes"] = prepared[choice - 1][1]
+                  selected["visual_confidence"] = confidence
+                  selected["visual_judgement"] = reason
+                  return selected
+              except Exception as error:
+                  print(f"Visual relevance check failed; refusing to trust keyword overlap alone: {error}")
+                  return None
+          
+          for scene_index, passage in enumerate(passages, start=1):
+              planned = scene_by_index.get(scene_index, {})
+              scene_title = clean_text(planned.get("title", "")) or f"Investigation visual {scene_index}"
+              keyword = clean_text(planned.get("keyword", ""))
+              visual_subject = clean_text(planned.get("visual_subject", ""))
+              visual_intent = clean_text(planned.get("visual_intent", ""))
+              search_query = clean_text(planned.get("query", ""))
+              if len(tokens(visual_subject)) < 2:
+                  visual_subject = scene_title if len(tokens(scene_title)) >= 2 else keyword
+              if len(tokens(keyword)) < 1:
+                  keyword = visual_subject
+              if len(tokens(search_query)) < 2:
+                  search_query = visual_subject
+              queries = scene_search_queries(search_query, scene_title, visual_subject, keyword)
+              print(f"Scene {scene_index:02d} subject '{visual_subject}' image search queries: {queries}")
+              candidate_pool = []
+              for query_index, candidate_query in enumerate(queries, start=1):
+                  try:
+                      candidates = image_candidates(candidate_query)
+                      candidate_pool.extend(candidates)
+                      if candidates:
+                          print(f"Found {len(candidates)} candidates for '{candidate_query}'.")
+                  except Exception as error:
+                      print(f"Image search failed for scene {scene_index}, query '{candidate_query}': {error}")
+                  if query_index < len(queries):
+                      time.sleep(1.5)
+          
+              deduplicated = {}
+              for candidate in candidate_pool:
+                  title_key = candidate.get("title", "").casefold()
+                  if title_key and (title_key not in deduplicated or candidate.get("match_score", 0) > deduplicated[title_key].get("match_score", 0)):
+                      deduplicated[title_key] = candidate
+              candidate_pool = list(deduplicated.values())
+              subject_tokens = tokens(visual_subject + " " + scene_title + " " + keyword)
+              for candidate in candidate_pool:
+                  candidate_tokens = tokens(candidate.get("searchable_text", "") + " " + candidate.get("title", ""))
+                  overlap = len(subject_tokens & candidate_tokens)
+                  candidate["semantic_score"] = overlap / max(1, len(subject_tokens))
+              candidate_pool.sort(key=lambda item: (item.get("semantic_score", 0), item.get("match_score", 0)), reverse=True)
+              plausible = [candidate for candidate in candidate_pool if candidate.get("semantic_score", 0) >= 0.08 or candidate.get("match_score", 0) >= 0.35]
+              selected = judge_visual_relevance(passage["text"], scene_title, visual_subject, plausible[:3]) if plausible else None
+          
+              if selected:
+                  filename = f"image-{scene_index}.jpg"
+                  (images / filename).write_bytes(selected.pop("_image_bytes"))
+                  selected["file"] = filename
+                  selected["scene"] = scene_index
+                  selected["search_query"] = search_query
+                  selected["visual_subject"] = visual_subject
+                  selected["visual_intent"] = visual_intent
+                  used_titles.add(selected["title"])
+                  print(f"Accepted visually checked image for scene {scene_index:02d}: {selected['title']} (confidence {selected.get('visual_confidence', 0):.2f})")
+              else:
+                  filename = f"image-{scene_index}.jpg"
+                  fallback_title = visual_subject or scene_title or topic or "Investigation context"
+                  make_context_card(images / filename, fallback_title, passage["text"])
+                  selected = {
+                      "url": "", "title": fallback_title,
+                      "creator": "Signal Brief", "license": "Original graphic",
+                      "license_url": "", "foreign_landing_url": "",
+                      "attribution": "Original explanatory graphic created by Signal Brief; not photographic evidence",
+                      "match_score": 0, "file": filename, "scene": scene_index,
+                      "search_query": "No candidate passed visual relevance check; original explanatory graphic used",
+                      "visual_subject": visual_subject, "visual_intent": visual_intent,
+                      "visual_confidence": 0, "reused_fallback": True
+                  }
+                  print(f"WARNING: no candidate passed visual relevance check for scene {scene_index:02d}; using an original explanatory graphic rather than an unrelated photo.")
+          
+              attribution.append(selected)
+              visual_kind = "licensed_image" if selected.get("license") != "Original graphic" else "original_graphic"
+          
+              scene_manifest.append({
+                  "index": scene_index,
+                  "title": scene_title,
+                  "keyword": keyword,
+                  "visual_subject": visual_subject,
+                  "visual_intent": visual_intent,
+                  "query": search_query,
+                  "visual_confidence": selected.get("visual_confidence", 0),
+                  "word_count": len(passage["text"].split()),
+                  "file": filename,
+                  "visual_kind": visual_kind
+              })
+          
+          # Last-chance visual integrity check: repair missing, corrupt, tiny, or
+          # nearly blank scene files with a locally rendered explanatory card.
+          for position, scene in enumerate(scene_manifest):
+              image_path = images / scene["file"]
+              invalid = not image_path.is_file() or image_path.stat().st_size < 10000
+              if not invalid:
+                  try:
+                      with Image.open(image_path) as check_image:
+                          check_image.verify()
+                      with Image.open(image_path) as check_image:
+                          check_image = check_image.convert("RGB")
+                          if check_image.width < 600 or check_image.height < 350:
+                              invalid = True
+                          else:
+                              extrema = check_image.getextrema()
+                              if all((high - low) < 3 for low, high in extrema):
+                                  invalid = True
+                  except Exception:
+                      invalid = True
+              if invalid:
+                  title_for_card = scene.get("visual_subject") or scene.get("title") or topic
+                  passage_text = passages[position]["text"] if position < len(passages) else script
+                  make_context_card(image_path, title_for_card, passage_text)
+                  attribution[position] = {
+                      "url": "", "title": title_for_card,
+                      "creator": "Signal Brief", "license": "Original graphic",
+                      "license_url": "", "foreign_landing_url": "",
+                      "attribution": "Original explanatory graphic created by Signal Brief; not photographic evidence",
+                      "match_score": 0, "file": scene["file"], "scene": scene["index"],
+                      "search_query": "Image integrity check repaired the scene with an original explanatory graphic",
+                      "visual_subject": scene.get("visual_subject", ""),
+                      "visual_intent": scene.get("visual_intent", ""),
+                      "visual_confidence": 0, "reused_fallback": True
+                  }
+                  scene["visual_kind"] = "original_graphic"
+                  scene["visual_confidence"] = 0
+                  print("Repaired invalid/blank visual for scene " + str(scene["index"]))
+
+          # Replace remaining temporary text cards with AI illustrations or approved
+          # relevant library b-roll. Never publish generic text-only slides.
+          from PIL import ImageDraw, ImageFont, ImageOps
+          confirmed = [i for i, scene in enumerate(scene_manifest) if scene["visual_kind"] == "licensed_image"]
+          missing = [i for i, scene in enumerate(scene_manifest) if scene["visual_kind"] == "original_graphic"]
+          ai_count = 0
+          if missing and enable_ai_images:
+              # Generate unique illustrations distributed throughout the story.
+              # Limit paid requests so costs remain bounded.
+              target_unique = max(8, (len(scene_manifest) + 3) // 4)
+              needed = max(0, target_unique - len(confirmed))
+              n_to_generate = min(len(missing), max_ai_images, needed)
+              stride = max(1, len(missing) / max(1, n_to_generate))
+              positions = [missing[min(len(missing) - 1, int(i * stride))] for i in range(n_to_generate)]
+              for pos in sorted(set(positions)):
+                  scene = scene_manifest[pos]
+                  filename = scene["file"]
+                  if not generate_illustration(
+                      images / filename, scene.get("title", ""), scene.get("visual_subject", ""),
+                      passages[pos]["text"],
+                  ):
+                      continue
+                  scene["visual_kind"] = "ai_generated"
+                  scene["visual_confidence"] = 0.65
+                  attribution[pos] = {
+                      "url": "", "title": scene.get("visual_subject", "") or scene.get("title", ""),
+                      "creator": "Signal Brief / Gemini", "license": "AI-generated illustration",
+                      "license_url": "", "foreign_landing_url": "",
+                      "attribution": "AI-generated editorial illustration; not a photograph or evidence of the claimed event",
+                      "match_score": 0, "file": filename, "scene": scene["index"],
+                      "search_query": "Gemini AI illustration for narration scene",
+                      "visual_subject": scene.get("visual_subject", ""),
+                      "visual_intent": scene.get("visual_intent", ""),
+                      "visual_confidence": 0.65, "reused_fallback": True,
+                  }
+                  confirmed.append(pos)
+                  ai_count += 1
+                  print(f"Visual fallback: generated labelled AI illustration for scene {scene['index']}.")
+
+          # One source may appear at most 4 times in total, including original.
+          max_uses = 4
+          scene_use_counts = {pos: 1 for pos in confirmed}
+          real_count = sum(scene_manifest[i]["visual_kind"] == "licensed_image" for i in confirmed)
+          unique_available = len(confirmed)
+          remaining = sum(scene["visual_kind"] == "original_graphic" for scene in scene_manifest)
+          if unique_available < 8 or remaining > sum(max_uses - scene_use_counts[i] for i in confirmed):
+              raise SystemExit(
+                  "VISUAL QUALITY BLOCK: not enough distinct images to fill this video without "
+                  f"excessive duplication (real={real_count}, AI={ai_count}, missing={remaining}, "
+                  f"max AI images={max_ai_images}, AI enabled={enable_ai_images}). "
+                  "Nothing uploaded. Add a Pexels/Pixabay key or enable billed Gemini images."
+              )
+          illustration_count = 0
+          for pos, scene in enumerate(scene_manifest):
+              if scene["visual_kind"] != "original_graphic":
+                  continue
+              target = tokens(
+                  scene.get("visual_subject", "") + " " + scene.get("title", "")
+                  + " " + passages[pos]["text"]
+              )
+              eligible = [i for i in confirmed if scene_use_counts[i] < max_uses]
+              if not eligible:
+                  raise SystemExit("VISUAL QUALITY BLOCK: insufficient image variety. Nothing uploaded.")
+              def fit_score(i):
+                  candidate = scene_manifest[i]
+                  terms = tokens(candidate.get("visual_subject", "") + " " + candidate.get("title", ""))
+                  return (len(terms & target), -scene_use_counts[i], -abs(i - pos))
+              original = max(eligible, key=fit_score)
+              source_path = images / scene_manifest[original]["file"]
+              target_path = images / scene["file"]
+              with Image.open(source_path) as source_image:
+                  rendered = ImageOps.fit(source_image.convert("RGB"), (1920, 1080), method=Image.Resampling.LANCZOS)
+              drawer = ImageDraw.Draw(rendered)
+              stamp_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 27)
+              # Never make reused imagery appear to depict a specific alleged event.
+              label = "AI ILLUSTRATION" if scene_manifest[original]["visual_kind"] == "ai_generated" else "ILLUSTRATIVE VISUAL"
+              drawer.rounded_rectangle((1380, 120, 1880, 182), radius=13, fill=(13, 17, 24))
+              drawer.text((1405, 137), label, font=stamp_font, fill=(231, 239, 245))
+              rendered.save(target_path, "JPEG", quality=88)
+              credits = dict(attribution[original])
+              credits.update({
+                  "file": scene["file"], "scene": scene["index"],
+                  "visual_subject": scene.get("visual_subject", ""),
+                  "visual_intent": scene.get("visual_intent", ""),
+                  "reused_fallback": True,
+                  "reused_from_scene": scene_manifest[original]["index"],
+                  "attribution": (credits.get("attribution", "") + "; illustrative b-roll, not evidence of an alleged event").strip("; "),
+              })
+              attribution[pos] = credits
+              scene["visual_kind"] = scene_manifest[original]["visual_kind"]
+              scene["visual_confidence"] = 0.55
+              scene["reused_broll"] = True
+              scene_use_counts[original] += 1
+              illustration_count += 1
+          print(
+              f"Visual integrity: {real_count} directly selected licensed images, "
+              f"{ai_count} generated AI illustrations, {illustration_count} labelled b-roll repeats "
+              f"across {len(scene_manifest)} scenes; zero generic text cards."
+          )
+          if any(scene["visual_kind"] == "original_graphic" for scene in scene_manifest):
+              raise SystemExit("VISUAL QUALITY BLOCK: a generic card survived the final visual replacement.")
+
+          (out / "attribution.json").write_text(
+              json.dumps(attribution, indent=2, ensure_ascii=False),
+              encoding="utf-8"
+          )
+          (out / "scenes.json").write_text(
+              json.dumps(scene_manifest, indent=2, ensure_ascii=False),
+              encoding="utf-8"
+          )
+          duration = float(subprocess.check_output([
+              "ffprobe", "-v", "error",
+              "-show_entries", "format=duration",
+              "-of", "default=noprint_wrappers=1:nokey=1",
+              str(out / "narration.wav")
+          ], text=True).strip())
+          
+          words = script.split()
+          
+          def stamp(seconds):
+              milliseconds = int(seconds * 1000)
+              hours, milliseconds = divmod(milliseconds, 3600000)
+              minutes, milliseconds = divmod(milliseconds, 60000)
+              seconds, milliseconds = divmod(milliseconds, 1000)
+              return f"{hours:02}:{minutes:02}:{seconds:02},{milliseconds:03}"
+          
+          # Align captions against the actual generated narration audio, rather than
+          # distributing script words evenly across the total duration.
+          try:
+              from faster_whisper import WhisperModel
+              print("Aligning subtitles to the actual narration audio with Whisper...")
+              whisper_model = WhisperModel("base", device="cpu", compute_type="int8")
+              segments, info = whisper_model.transcribe(
+                  str(out / "narration.wav"),
+                  word_timestamps=True,
+                  vad_filter=True,
+                  beam_size=5
+              )
+              spoken_words = []
+              for segment in segments:
+                  for word in (segment.words or []):
+                      token = word.word.strip()
+                      if token and word.end > word.start:
+                          spoken_words.append({
+                              "text": token,
+                              "start": max(0.0, float(word.start)),
+                              "end": min(duration, float(word.end))
+                          })
+              if len(spoken_words) < max(30, int(len(words) * 0.55)):
+                  raise RuntimeError(
+                      f"Whisper aligned only {len(spoken_words)} words for a {len(words)}-word script."
+                  )
+
+              # Detect the end of actual speech in the WAV. If Whisper timestamps
+              # drift progressively ahead/behind, calibrate the full timeline to speech.
+              silence_check = subprocess.run(
+                  ["ffmpeg", "-hide_banner", "-i", str(out / "narration.wav"),
+                   "-af", "silencedetect=noise=-42dB:d=0.20", "-f", "null", "-"],
+                  capture_output=True, text=True, check=False
+              )
+              silence_log = silence_check.stderr or ""
+              silence_starts = [float(value) for value in re.findall(r"silence_start: ([0-9]+(?:\.[0-9]+)?)", silence_log)]
+              last_silence_start = silence_starts[-1] if silence_starts else duration
+              # Only treat the final detected silence as trailing silence when it
+              # actually occurs near the end of the file; ignore ordinary pauses.
+              speech_end = last_silence_start if duration - last_silence_start <= 1.5 else duration
+              last_word_end = spoken_words[-1]["end"]
+              if speech_end > 1 and last_word_end > 1:
+                  correction = speech_end / last_word_end
+                  if 0.90 <= correction <= 1.12 and abs(correction - 1.0) >= 0.005:
+                      anchor = spoken_words[0]["start"]
+                      for spoken in spoken_words:
+                          spoken["start"] = max(0.0, anchor + (spoken["start"] - anchor) * correction)
+                          spoken["end"] = min(speech_end, anchor + (spoken["end"] - anchor) * correction)
+                      print(f"Subtitle timing calibrated by factor {correction:.4f} against detected speech end {speech_end:.2f}s.")
+                  elif abs(correction - 1.0) > 0.12:
+                      raise RuntimeError(f"Subtitle timestamps are unreliable: speech-end correction factor would be {correction:.3f}.")
+              if any(spoken_words[i]["start"] < spoken_words[i - 1]["start"] for i in range(1, len(spoken_words))):
+                  raise RuntimeError("Whisper returned non-monotonic subtitle timestamps.")
+          
+              caption_groups = []
+              current = []
+              group_start = None
+              group_end = None
+              for spoken in spoken_words:
+                  if current and (
+                      len(current) >= 7
+                      or spoken["end"] - group_start >= 3.2
+                      or spoken["start"] - group_end >= 0.65
+                  ):
+                      caption_groups.append((group_start, group_end, " ".join(x["text"] for x in current)))
+                      current = []
+                      group_start = None
+                  if not current:
+                      group_start = spoken["start"]
+                  current.append(spoken)
+                  group_end = spoken["end"]
+              if current:
+                  caption_groups.append((group_start, group_end, " ".join(x["text"] for x in current)))
+          
+              with open(out / "captions.srt", "w", encoding="utf-8") as file:
+                  for index, (start, end, caption_text) in enumerate(caption_groups, start=1):
+                      start = max(0.0, start)
+                      end = min(duration, max(start + 0.25, end))
+                      file.write(
+                          f"{index}\n{stamp(start)} --> {stamp(end)}\n"
+                          + caption_text + "\n\n"
+                      )
+              print(f"Created {len(caption_groups)} narration-aligned subtitle cues from {len(spoken_words)} recognised words.")
+          except Exception as error:
+              raise SystemExit(
+                  f"Subtitle alignment failed ({error}). Refusing to publish a video with guessed or drifting captions; rerun the workflow to retry alignment."
+              )
+          
+          scene_total = sum(max(1, item.get("word_count", 1)) for item in scene_manifest)
+          scene_timings = []
+          cursor = 0.0
+          for item in scene_manifest:
+              segment_duration = duration * max(1, item.get("word_count", 1)) / scene_total
+              scene_timings.append({
+                  **item,
+                  "start": cursor,
+                  "duration": segment_duration
+              })
+              cursor += segment_duration
+          
+          if scene_timings:
+              short_scenes = [item for item in scene_timings if item["duration"] < 1.0]
+              for short_scene in short_scenes:
+                  deficit = 1.0 - short_scene["duration"]
+                  donors = sorted(
+                      [item for item in scene_timings if item is not short_scene and item["duration"] > 1.0 + deficit],
+                      key=lambda item: item["duration"],
+                      reverse=True
+                  )
+                  for donor in donors:
+                      available = donor["duration"] - 1.0
+                      transfer = min(deficit, available)
+                      donor["duration"] -= transfer
+                      short_scene["duration"] += transfer
+                      deficit -= transfer
+                      if deficit <= 0.0001:
+                          break
+              cursor = 0.0
+              for item in scene_timings:
+                  item["start"] = cursor
+                  cursor += item["duration"]
+              if any(item["duration"] < 0.999 for item in scene_timings):
+                  raise SystemExit("Visual timing failed: a keyword image beat would be under one second.")
+          
+          (out / "scene-timings.json").write_text(
+              json.dumps(scene_timings, indent=2, ensure_ascii=False),
+              encoding="utf-8"
+          )
+          (out / "duration.txt").write_text(str(duration), encoding="utf-8")
+          print(f"Prepared script, narration and {len(attribution)} scene-matched visuals.")
+          PY
+
+          python build.py
+
+      - name: Validate generated script, narration and images
+        run: |
+          set -euo pipefail
+
+          python - <<'PY'
+          import json
+          import subprocess
+          from pathlib import Path
+
+          out = Path("output")
+          script_path = out / "script.txt"
+          narration_path = out / "narration.wav"
+          attribution_path = out / "attribution.json"
+          scenes_path = out / "scenes.json"
+          images_dir = out / "images"
+
+          for path in (script_path, narration_path, attribution_path, scenes_path):
+              if not path.is_file() or path.stat().st_size == 0:
+                  raise SystemExit(f"Quality check failed: {path} is missing or empty.")
+
+          script = script_path.read_text(encoding="utf-8").strip()
+          words = script.split()
+          if len(words) < 900:
+              raise SystemExit(
+                  f"Quality check failed: narration has only {len(words)} words; "
+                  "at least 900 are required for an investigative deep dive."
+              )
+
+          if len(words) > 1800:
+              raise SystemExit(
+                  f"Quality check failed: narration has {len(words)} words; "
+                  "maximum allowed is 1800 for this workflow."
+              )
+
+          audio_probe = subprocess.run(
+              [
+                  "ffprobe", "-v", "error",
+                  "-show_entries", "format=duration",
+                  "-of", "default=noprint_wrappers=1:nokey=1",
+                  str(narration_path)
+              ],
+              capture_output=True, text=True, check=True
+          )
+          duration = float(audio_probe.stdout.strip())
+          if duration < 60:
+              raise SystemExit(
+                  f"Quality check failed: narration audio is only {duration:.1f} seconds."
+              )
+
+          attribution = json.loads(attribution_path.read_text(encoding="utf-8"))
+          scenes = json.loads(scenes_path.read_text(encoding="utf-8"))
+          images = sorted(images_dir.glob("image-*.jpg"))
+
+          if not scenes or len(images) != len(scenes):
+              raise SystemExit(
+                  f"Quality check failed: {len(scenes)} scenes but {len(images)} images. "
+                  "Every scene must have its own verified image."
+              )
+          allowed_visual_kinds = {"licensed_image", "ai_generated"}
+          invalid_scenes = [
+              scene.get("index", "?")
+              for scene in scenes
+              if scene.get("visual_kind") not in allowed_visual_kinds
+          ]
+          if invalid_scenes:
+              raise SystemExit(
+                  "Quality check failed: scenes have an unsupported/placeholder visual type: "
+                  + ", ".join(map(str, invalid_scenes))
+              )
+          licensed_count = sum(1 for scene in scenes if scene.get("visual_kind") == "licensed_image")
+          ai_scene_count = sum(1 for scene in scenes if scene.get("visual_kind") == "ai_generated")
+          if licensed_count + ai_scene_count != len(scenes):
+              raise SystemExit("Quality check failed: one or more scenes have no usable visual.")
+          distinct_real = {
+              item.get("foreign_landing_url") or item.get("title")
+              for item in attribution
+              if item.get("license") not in {"Original graphic", "AI-generated illustration"}
+          }
+          distinct_ai = {
+              item.get("reused_from_scene") or item.get("scene")
+              for item in attribution if item.get("license") == "AI-generated illustration"
+          }
+          if len(distinct_real) + len(distinct_ai) < 8:
+              raise SystemExit(
+                  f"VISUAL QUALITY BLOCK: only {len(distinct_real)} unique real image sources and "
+                  f"{len(distinct_ai)} unique AI illustrations. Refusing to render/upload."
+              )
+
+          for image in images:
+              if image.stat().st_size < 10000:
+                  raise SystemExit(f"Quality check failed: {image.name} is unexpectedly small.")
+
+          attribution_files = {item.get("file") for item in attribution}
+          for image in images:
+              if image.name not in attribution_files:
+                  raise SystemExit(
+                      f"Quality check failed: {image.name} has no matching attribution record."
+                  )
+
+          print(f"Script: {len(words)} words")
+          print(f"Narration: {duration:.1f} seconds")
+          print(f"Scenes with verified licensed images: {licensed_count}")
+          print(f"Scenes with AI illustrations: {ai_scene_count}")
+          print("Pre-production quality checks passed.")
+          PY
+
+      - name: Create custom Signal Brief thumbnail
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          import re
+          from pathlib import Path
+          from PIL import Image, ImageDraw, ImageFont, ImageEnhance, ImageFilter, ImageOps
+
+          out = Path("output")
+          scenes = json.loads((out / "scenes.json").read_text(encoding="utf-8"))
+          title_path = out / "video-title.txt"
+          topic = (out / "topic.txt").read_text(encoding="utf-8").strip()
+          title = title_path.read_text(encoding="utf-8").strip() if title_path.exists() else topic
+          images_dir = out / "images"
+
+          # Prefer a directly relevant image that passed the visual judge; otherwise
+          # use the first scene image, which may be an original context card.
+          candidates = sorted(
+              scenes,
+              key=lambda item: (float(item.get("visual_confidence", 0)), int(item.get("index", 0))),
+              reverse=True,
+          )
+          background_path = None
+          for scene in candidates:
+              candidate = images_dir / scene.get("file", "")
+              if candidate.is_file():
+                  background_path = candidate
+                  break
+          if background_path is None:
+              raise SystemExit("Cannot create thumbnail: no generated scene image is available.")
+
+          image = Image.open(background_path).convert("RGB")
+          image = ImageOps.fit(image, (1280, 720), method=Image.Resampling.LANCZOS, centering=(0.5, 0.45))
+          image = ImageEnhance.Contrast(image).enhance(1.18)
+          image = ImageEnhance.Color(image).enhance(1.15)
+          image = image.filter(ImageFilter.GaussianBlur(0.35))
+          overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
+          od = ImageDraw.Draw(overlay)
+          for x in range(1280):
+              alpha = int(205 * (1 - x / 1280) ** 0.55)
+              od.line((x, 0, x, 720), fill=(5, 8, 16, alpha))
+          od.rectangle((0, 0, 1280, 112), fill=(4, 7, 13, 205))
+          od.rectangle((0, 0, 15, 720), fill=(255, 64, 64, 255))
+          image = Image.alpha_composite(image.convert("RGBA"), overlay)
+          draw = ImageDraw.Draw(image)
+          font_bold = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+          font_regular = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+          brand_font = ImageFont.truetype(font_bold, 36)
+          title_font_size = 78
+          title_font = ImageFont.truetype(font_bold, title_font_size)
+
+          draw.text((58, 34), "SIGNAL BRIEF", font=brand_font, fill=(255, 255, 255, 255), stroke_width=1, stroke_fill=(0, 0, 0, 200))
+          draw.rounded_rectangle((58, 98, 258, 106), radius=4, fill=(255, 64, 64, 255))
+
+          clean_title = re.sub(r"\s+", " ", title).strip()
+          # A question is the strongest thumbnail hook. Keep the first question from
+          # the generated title and discard trailing wording such as "Investigating the Evidence".
+          question_end = clean_title.find("?")
+          if question_end >= 0:
+              clean_title = clean_title[:question_end + 1].strip()
+          else:
+              clean_title = re.split(r"\s+[|—–:]\s+", clean_title, maxsplit=1)[0].strip()
+          if not clean_title:
+              clean_title = "What Is Really Going On?"
+          words = clean_title.split()
+          lines, current = [], ""
+          max_width = 720
+          for word in words:
+              trial = (current + " " + word).strip()
+              if draw.textbbox((0, 0), trial, font=title_font, stroke_width=2)[2] <= max_width:
+                  current = trial
+              else:
+                  if current:
+                      lines.append(current)
+                  current = word
+          if current:
+              lines.append(current)
+          while len(lines) > 3 or any(draw.textbbox((0, 0), line, font=title_font, stroke_width=2)[2] > max_width for line in lines):
+              title_font_size -= 4
+              if title_font_size < 42:
+                  break
+              title_font = ImageFont.truetype(font_bold, title_font_size)
+              lines, current = [], ""
+              for word in words:
+                  trial = (current + " " + word).strip()
+                  if draw.textbbox((0, 0), trial, font=title_font, stroke_width=2)[2] <= max_width:
+                      current = trial
+                  else:
+                      if current:
+                          lines.append(current)
+                      current = word
+              if current:
+                  lines.append(current)
+          if len(lines) > 3:
+              lines = lines[:2] + [" ".join(lines[2:])]
+
+          y = 185
+          for line in lines:
+              draw.text((58, y), line, font=title_font, fill=(255, 255, 255, 255), stroke_width=4, stroke_fill=(0, 0, 0, 235))
+              y += title_font_size + 18
+          draw.text((60, 654), "THE CLAIM. THE EVIDENCE. THE TRUTH.", font=ImageFont.truetype(font_regular, 23), fill=(245, 245, 245, 245), stroke_width=2, stroke_fill=(0, 0, 0, 220))
+
+          image.convert("RGB").save(out / "thumbnail.jpg", quality=92, optimize=True)
+          if (out / "thumbnail.jpg").stat().st_size > 2_000_000:
+              image.convert("RGB").save(out / "thumbnail.jpg", quality=84, optimize=True)
+          print(f"Created custom 1280x720 thumbnail for: {title}")
+          PY
+
+      - name: Generate original procedural background music
+        run: |
+          set -euo pipefail
+
+          python - <<'PY'
+          import math
+          import random
+          import wave
+          import struct
+          from pathlib import Path
+
+          duration = float(Path("output/duration.txt").read_text().strip()) + 4
+          sample_rate = 22050
+          rng = random.SystemRandom()
+          seed = rng.randrange(1, 2**31)
+          random.seed(seed)
+
+          root_notes = random.choice([55.0, 61.74, 65.41, 73.42, 82.41])
+          chord_sets = [
+              [1.0, 1.1892, 1.4983],
+              [1.0, 1.1892, 1.4142],
+              [1.0, 1.2599, 1.4983],
+              [1.0, 1.1225, 1.3348]
+          ]
+          chords = [random.choice(chord_sets) for _ in range(4)]
+          chord_length = max(8.0, duration / 4)
+          total_samples = int(duration * sample_rate)
+          pulse_rate = random.choice([0.04, 0.06, 0.08])
+          output = Path("output/background-music.wav")
+
+          with wave.open(str(output), "wb") as wav:
+              wav.setnchannels(2)
+              wav.setsampwidth(2)
+              wav.setframerate(sample_rate)
+
+              buffer = bytearray()
+
+              for start in range(0, total_samples, 4096):
+                  end = min(start + 4096, total_samples)
+
+                  for n in range(start, end):
+                      t = n / sample_rate
+                      chord_index = min(3, int(t / chord_length))
+                      chord = chords[chord_index]
+                      fade_in = min(1.0, t / 2.5)
+                      fade_out = min(1.0, max(0.0, (duration - t) / 3.5))
+                      envelope = fade_in * fade_out
+
+                      left = 0.0
+                      right = 0.0
+
+                      for i, ratio in enumerate(chord):
+                          frequency = root_notes * ratio
+                          slow_motion = 1.0 + 0.003 * math.sin(
+                              2 * math.pi * (0.025 + i * 0.009) * t
+                          )
+                          phase = 2 * math.pi * frequency * slow_motion * t
+                          tone = (
+                              math.sin(phase)
+                              + 0.28 * math.sin(phase * 2.003)
+                          ) / 1.28
+                          left += tone * (0.16 / (i + 1))
+                          right += math.sin(phase + 0.12 * i) * (0.16 / (i + 1))
+
+                      drone = (
+                          math.sin(2 * math.pi * (root_notes / 2) * t) * 0.12
+                          + math.sin(2 * math.pi * (root_notes / 2.01) * t) * 0.08
+                      )
+
+                      pulse = max(
+                          0.0,
+                          math.sin(2 * math.pi * pulse_rate * t)
+                      ) ** 8 * 0.035
+
+                      left = (left * 0.55 + drone + pulse) * envelope
+                      right = (right * 0.55 + drone + pulse) * envelope
+
+                      left = max(-0.8, min(0.8, left))
+                      right = max(-0.8, min(0.8, right))
+
+                      buffer.extend(struct.pack(
+                          "<hh",
+                          int(left * 32767),
+                          int(right * 32767)
+                      ))
+
+                  wav.writeframesraw(buffer)
+                  buffer.clear()
+
+          print(f"Generated an original cinematic ambient soundtrack using seed {seed}.")
+          print(f"Music duration: {duration:.1f} seconds.")
+          PY
 
       - name: Assemble MP4 reliably (small scene clips, not a giant filter graph)
         run: |
@@ -97,6 +2110,256 @@
               str(out / "signal-brief.mp4")
           ], "final assembly")
           print("Reliable video rendering completed successfully.")
+          # Only keep the final video, not dozens of intermediate clips.
+          import shutil
+          shutil.rmtree(clips, ignore_errors=True)
+          concat_file.unlink(missing_ok=True)
           PY_RENDER
 
+      - name: Upload render diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: signal-brief-render-debug
+          path: output/render-log.txt
+          if-no-files-found: ignore
+          retention-days: 7
 
+      - name: Validate final video
+        run: |
+          set -euo pipefail
+
+          video="output/signal-brief.mp4"
+
+          if [ ! -s "$video" ]; then
+            echo "Quality check failed: final MP4 is missing or empty."
+            exit 1
+          fi
+
+          duration=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$video")
+          size=$(stat -c%s "$video")
+
+          python - "$duration" "$size" <<'PY'
+          import sys
+
+          duration = float(sys.argv[1])
+          size = int(sys.argv[2])
+
+          if duration < 60:
+              raise SystemExit(f"Final video is too short: {duration:.1f} seconds.")
+          if size < 500000:
+              raise SystemExit(f"Final video file is unexpectedly small: {size} bytes.")
+          thumbnail = __import__("pathlib").Path("output/thumbnail.jpg")
+          if not thumbnail.is_file() or thumbnail.stat().st_size == 0:
+              raise SystemExit("Thumbnail quality check failed: output/thumbnail.jpg is missing.")
+
+          print(f"Final MP4 verified: {duration:.1f} seconds, {size:,} bytes; custom thumbnail is present.")
+          PY
+
+          ffmpeg -v error -i "$video" -f null -
+
+      - name: Upload video to YouTube and schedule release
+        env:
+          YOUTUBE_CLIENT_ID: ${{ secrets.YOUTUBE_CLIENT_ID }}
+          YOUTUBE_CLIENT_SECRET: ${{ secrets.YOUTUBE_CLIENT_SECRET }}
+          YOUTUBE_REFRESH_TOKEN: ${{ secrets.YOUTUBE_REFRESH_TOKEN }}
+          PUBLISH_SLOT: ${{ inputs.publish_slot || 'private' }}
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet google-api-python-client google-auth google-auth-httplib2
+
+          python - <<'PY'
+          import json
+          import os
+          from datetime import datetime, timedelta, timezone
+          from zoneinfo import ZoneInfo
+          from pathlib import Path
+          from google.oauth2.credentials import Credentials
+          from googleapiclient.discovery import build
+          from googleapiclient.http import MediaFileUpload
+
+          required = [
+              "YOUTUBE_CLIENT_ID",
+              "YOUTUBE_CLIENT_SECRET",
+              "YOUTUBE_REFRESH_TOKEN",
+          ]
+          missing = [name for name in required if not os.environ.get(name)]
+          if missing:
+              raise SystemExit(
+                  "Missing GitHub repository secrets: " + ", ".join(missing)
+              )
+
+          out = Path("output")
+          topic = (out / "topic.txt").read_text(encoding="utf-8").strip()
+          video_path = out / "signal-brief.mp4"
+          attributions = json.loads(
+              (out / "attribution.json").read_text(encoding="utf-8")
+          )
+
+          title_path = out / "video-title.txt"
+          title = title_path.read_text(encoding="utf-8").strip() if title_path.exists() else ("The Evidence Behind " + topic)
+          if len(title) > 98:
+              title = title[:95].rstrip() + "..."
+          news_sources = json.loads((out / "news-sources.json").read_text(encoding="utf-8"))
+
+          description_lines = [
+              "SIGNAL BRIEF | Investigations, internet mysteries and the evidence behind viral claims.",
+              "",
+              "An evidence-led investigation based on the sources listed below. Online claims are assessed against available records and reporting; uncertainty is stated where evidence is incomplete.",
+              "",
+              "NEWS SOURCES",
+          ]
+          for item in news_sources[:4]:
+              description_lines.append(
+                  f"- {item['source']} ({item['published'][:10]}): {item['url']}"
+              )
+          description_lines += [
+              "",
+              "IMAGE CREDITS AND LICENCES",
+              "Images come from Wikimedia Commons, Openverse, Pexels and Pixabay, where available. Review each linked source and licence before publishing.",
+          ]
+          licence_groups = {}
+          generated_count = 0
+          for item in attributions:
+              licence_name = item.get("license") or "Licence listed on source page"
+              source_url = item.get("foreign_landing_url") or ""
+              if source_url:
+                  licence_groups.setdefault(licence_name, set()).add(source_url)
+              elif licence_name == "AI-generated illustration":
+                  generated_count += 1
+          for licence_name, source_urls in sorted(licence_groups.items()):
+              description_lines.append(licence_name + ": " + " ".join(sorted(source_urls)))
+          if generated_count:
+              description_lines.append(
+                  f"AI-generated illustrative scene uses: {generated_count}; not photographic evidence of actual events."
+              )
+          description_lines += [
+              "",
+              "Narration and original background music were generated for this video. Illustrative images "
+              "should not be assumed to depict the exact moment described unless their source confirms it.",
+              "",
+              "Channel: Signal Brief",
+          ]
+          description = "\n".join(description_lines)
+          if len(description) > 4900:
+              raise SystemExit(
+                  f"Description needs {len(description)} characters, exceeding YouTube's limit after "
+                  "including source and image licence credits. Reduce the number of source images rather "
+                  "than silently omitting required attribution."
+              )
+
+          credentials = Credentials(
+              token=None,
+              refresh_token=os.environ["YOUTUBE_REFRESH_TOKEN"],
+              token_uri="https://oauth2.googleapis.com/token",
+              client_id=os.environ["YOUTUBE_CLIENT_ID"],
+              client_secret=os.environ["YOUTUBE_CLIENT_SECRET"],
+              scopes=["https://www.googleapis.com/auth/youtube.upload"],
+          )
+          youtube = build("youtube", "v3", credentials=credentials)
+
+          status_body = {
+              "privacyStatus": "private",
+              "selfDeclaredMadeForKids": False,
+              "containsSyntheticMedia": bool(generated_count),
+          }
+          # Only explicitly marked dispatches schedule a YouTube release.
+          # The GitHub UI's default 'private' choice remains safe for testing.
+          publish_slot = os.environ.get("PUBLISH_SLOT", "private").strip().lower()
+          slot_to_hour = {"noon": 12, "afternoon": 17, "evening": 20}
+          if publish_slot not in slot_to_hour and publish_slot != "private":
+              raise SystemExit(f"Invalid publication slot: {publish_slot!r}")
+          scheduled_publish_at = None
+          if publish_slot in slot_to_hour:
+              london = ZoneInfo("Europe/London")
+              now_london = datetime.now(london)
+              publish_local = now_london.replace(
+                  hour=slot_to_hour[publish_slot], minute=0, second=0, microsecond=0
+              )
+              # Never set a publication time less than 15 minutes away.
+              if publish_local <= now_london + timedelta(minutes=15):
+                  publish_local += timedelta(days=1)
+              scheduled_publish_at = publish_local.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+              status_body["publishAt"] = scheduled_publish_at
+              print(f"External scheduler slot {publish_slot}: scheduling YouTube release for {publish_local.strftime('%A %d %B %Y at %H:%M')} UK time.")
+          else:
+              print("Private test run: uploading privately for review, with no scheduled public release.")
+
+          request = youtube.videos().insert(
+              part="snippet,status",
+              body={
+                  "snippet": {
+                      "title": title,
+                      "description": description,
+                      "categoryId": "27",
+                      "defaultLanguage": "en-GB",
+                  },
+                  "status": status_body,
+              },
+              media_body=MediaFileUpload(
+                  str(video_path),
+                  mimetype="video/mp4",
+                  chunksize=8 * 1024 * 1024,
+                  resumable=True,
+              ),
+          )
+
+          response = None
+          while response is None:
+              status, response = request.next_chunk()
+              if status:
+                  print(f"YouTube upload progress: {int(status.progress() * 100)}%")
+
+          video_id = response.get("id")
+          if not video_id:
+              raise SystemExit("YouTube did not return a video ID.")
+
+          thumbnail_path = out / "thumbnail.jpg"
+          if not thumbnail_path.is_file() or thumbnail_path.stat().st_size == 0:
+              raise SystemExit("Custom thumbnail is missing; refusing to report a complete upload.")
+          youtube.thumbnails().set(
+              videoId=video_id,
+              media_body=MediaFileUpload(str(thumbnail_path), mimetype="image/jpeg"),
+          ).execute()
+          print("Custom Signal Brief thumbnail uploaded successfully.")
+          if scheduled_publish_at:
+              print("Upload complete. Video is scheduled; confirm its release time in YouTube Studio.")
+          else:
+              print("Upload complete. Video is PRIVATE pending your review.")
+          print("YouTube Studio URL: https://studio.youtube.com/video/" + video_id + "/edit")
+
+          # Persist the topic only after YouTube confirms the upload succeeded.
+          import subprocess
+          history_path = Path("topic-history.json")
+          try:
+              history_data = json.loads(history_path.read_text(encoding="utf-8")) if history_path.exists() else {"topics": []}
+          except Exception:
+              history_data = {"topics": []}
+          topics = history_data.setdefault("topics", [])
+          if topic and topic.casefold() not in {str(value).casefold() for value in topics}:
+              topics.append(topic)
+          history_path.write_text(json.dumps({"topics": topics[-500:]}, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+          subprocess.run(["git", "config", "user.name", "github-actions[bot]"], check=True)
+          subprocess.run(["git", "config", "user.email", "41898282+github-actions[bot]@users.noreply.github.com"], check=True)
+          subprocess.run(["git", "add", "topic-history.json"], check=True)
+          staged = subprocess.run(["git", "diff", "--cached", "--quiet"])
+          if staged.returncode == 1:
+              subprocess.run(["git", "commit", "-m", "Track uploaded video topic history"], check=True)
+              pushed = subprocess.run(["git", "push"], capture_output=True, text=True)
+              if pushed.returncode != 0:
+                  print("WARNING: upload succeeded, but topic history could not be pushed: " + pushed.stderr[-1000:])
+          (out / "youtube-upload.txt").write_text(
+              "Video ID: " + video_id + "\n"
+              + "Studio URL: https://studio.youtube.com/video/" + video_id + "/edit\n"
+              + ("Scheduled publish time: " + scheduled_publish_at + "\n" if scheduled_publish_at else "Privacy: private\n"),
+              encoding="utf-8",
+          )
+          PY
+
+      - name: Upload finished video and source files
+        uses: actions/upload-artifact@v4
+        with:
+          name: signal-brief-video
+          path: output/
+          if-no-files-found: error
+          retention-days: 7
