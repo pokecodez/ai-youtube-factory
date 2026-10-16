@@ -1,9 +1,9 @@
-name: Signal Brief - Current News Video
+name: Signal Brief - Five Daily Documentaries
 
 # External scheduler version: intentionally no GitHub cron trigger to avoid
 # duplicate uploads if GitHub's own scheduler later starts working again.
 # Use cron-job.org or another trusted scheduler to POST workflow_dispatch
-# with inputs.publish_slot = noon | afternoon | evening.
+# with inputs.publish_slot = morning | noon | afternoon | evening | night.
 # Manual GitHub runs default to a PRIVATE test upload.
 on:
   workflow_dispatch:
@@ -15,9 +15,11 @@ on:
         default: private
         options:
           - private
+          - morning
           - noon
           - afternoon
           - evening
+          - night
 
 permissions:
   contents: write
@@ -47,13 +49,14 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install --quiet requests pillow "av==14.2.0" "faster-whisper==1.1.1" --only-binary=av
 
-      - name: Research current news, write narration and match visuals
+      - name: Research category documentary, narrate and match visuals
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
           PIXABAY_API_KEY: ${{ secrets.PIXABAY_API_KEY }}
           ENABLE_AI_IMAGES: "false"  # Change to "true" after enabling paid Gemini image generation.
           MAX_AI_IMAGES_PER_VIDEO: "18"
+          PUBLISH_SLOT: ${{ inputs.publish_slot || 'private' }}
         run: |
           set -euo pipefail
 
@@ -113,371 +116,158 @@ jobs:
                   time.sleep(wait_seconds)
               raise RuntimeError(f"Gemini request failed: {last_error}")
           
-          feeds = [
-              ("BBC World", "https://feeds.bbci.co.uk/news/world/rss.xml"),
-              ("BBC UK", "https://feeds.bbci.co.uk/news/uk/rss.xml"),
-              ("The Guardian World", "https://www.theguardian.com/world/rss"),
-              ("The Guardian Technology", "https://www.theguardian.com/technology/rss"),
-              ("NPR World", "https://feeds.npr.org/1004/rss.xml"),
-              ("Al Jazeera News", "https://www.aljazeera.com/xml/rss/all.xml"),
-          ]
+          # Five distinct evergreen categories. Slot ids deliberately retain old names,
+          # so existing cron-job.org webhook payloads keep working.
+          slot = os.environ.get("PUBLISH_SLOT", "private").strip().lower()
+          slot_categories = {
+              "morning": "cryptids and creatures", "noon": "internet mysteries and disturbing media",
+              "afternoon": "real-world mysteries", "evening": "conspiracies and secrets",
+              "night": "strange and unexplained phenomena",
+          }
+          if slot != "private" and slot not in slot_categories:
+              raise SystemExit(f"Unrecognised dispatch slot: {slot}")
+          # Private test defaults to cryptids; choose any category by setting a slot.
+          category = slot_categories.get(slot, "cryptids and creatures")
+          print(f"Signal Brief category for slot {slot}: {category}")
           from datetime import datetime, timezone, timedelta
           from email.utils import parsedate_to_datetime
-          import xml.etree.ElementTree as ET
-          from html.parser import HTMLParser
           from urllib.parse import quote
-          
-          class TrendTableParser(HTMLParser):
-              def __init__(self):
-                  super().__init__(convert_charrefs=True)
-                  self.in_row = False
-                  self.in_cell = False
-                  self.cell_parts = []
-                  self.cells = []
-                  self.rows = []
-              def handle_starttag(self, tag, attrs):
-                  tag = tag.lower()
-                  if tag == "tr":
-                      self.in_row = True
-                      self.cells = []
-                  elif tag in ("td", "th") and self.in_row:
-                      self.in_cell = True
-                      self.cell_parts = []
-              def handle_data(self, data):
-                  if self.in_cell:
-                      value = data.strip()
-                      if value:
-                          self.cell_parts.append(value)
-              def handle_endtag(self, tag):
-                  tag = tag.lower()
-                  if tag in ("td", "th") and self.in_cell:
-                      self.cells.append(" ".join(self.cell_parts).strip())
-                      self.in_cell = False
-                      self.cell_parts = []
-                  elif tag == "tr" and self.in_row:
-                      if self.cells:
-                          self.rows.append(self.cells[:])
-                      self.in_row = False
-                      self.cells = []
-          
-          social_topic_signals = []
-          trend_signals = []
-          
-          def add_social_signal(value, source):
-              value = html.unescape(re.sub(r"\s+", " ", value or "")).strip()
-              value = re.sub(r"\s*[-|:]\s*(Reddit|YouTube|TikTok|Instagram|X|Twitter)$", "", value, flags=re.I).strip()
-              if len(value) < 5 or len(value) > 180:
-                  return
-              if value.lower() in {"home", "popular", "trending", "top", "news", "video"}:
-                  return
-              if not any(ch.isalpha() for ch in value):
-                  return
-              if value not in social_topic_signals:
-                  social_topic_signals.append(value)
-                  print(f"Social topic signal ({source}): {value[:120]}")
-          
-          social_sources = [
-              ("Google Trends UK", "https://trends.google.com/trending/rss?geo=GB"),
-              ("Google Trends US", "https://trends.google.com/trending/rss?geo=US"),
-          ]
-          for source_name, source_url in social_sources:
-              try:
-                  trend_response = requests.get(
-                      source_url,
-                      headers={"User-Agent": "Mozilla/5.0 (compatible; SignalBrief/1.0)"},
-                      timeout=18
-                  )
-                  trend_response.raise_for_status()
-                  root = ET.fromstring(trend_response.content)
-                  found = 0
-                  for entry in root.findall(".//item")[:30]:
-                      title_node = entry.find("title")
-                      if title_node is not None and title_node.text:
-                          add_social_signal(title_node.text, source_name)
-                          found += 1
-                  print(f"Loaded {found} search-trend signals from {source_name}.")
-              except Exception as error:
-                  print(f"Trend source unavailable ({source_name}): {error}")
-          
-          try:
-              reddit_response = requests.get(
-                  "https://www.reddit.com/r/popular/hot.json?limit=30",
-                  headers={"User-Agent": "SignalBrief/1.0 (current affairs topic research)"},
-                  timeout=18
-              )
-              reddit_response.raise_for_status()
-              reddit_posts = reddit_response.json().get("data", {}).get("children", [])
-              for post in reddit_posts:
-                  data = post.get("data", {})
-                  title = data.get("title", "")
-                  subreddit = data.get("subreddit", "")
-                  if subreddit.lower() in {"memes", "funny", "askreddit", "gaming", "music", "videos", "aww"}:
-                      continue
-                  if title:
-                      add_social_signal(title, "Reddit popular / " + subreddit)
-              print(f"Loaded social discussion signals from {len(reddit_posts)} Reddit popular posts.")
-          except Exception as error:
-              print(f"Social source unavailable (Reddit popular): {error}")
-          
-          # Discover major non-political stories people are discussing online.
-          # These searches are leads, not proof that a topic is trending.
-          topic_searches = [
-              "viral internet mystery claim fact check evidence social media when:7d",
-              "major online conspiracy claim investigation fact check when:7d",
-              "celebrity scandal controversy investigation court documents when:7d",
-              "high profile case viral claims evidence fact check when:7d",
-              "Epstein alive claim fact check evidence social media when:30d",
-              "Bohemian Grove claims investigation evidence fact check when:30d",
-              "Diddy online claims misinformation fact check when:30d",
-              "viral celebrity controversy misinformation investigation when:7d",
-          ]
-          
-          def is_political_topic(value):
-              text_value = value.lower()
-              # Explicitly keep the user's requested subject areas eligible.
-              if any(term in text_value for term in ("epstein", "sean combs", "diddy", "bohemian grove")):
-                  return False
-              political_patterns = [
-                  r"\belection(s)?\b", r"\belectoral\b", r"\bpresident(ial)?\b",
-                  r"\bprime minister\b", r"\bparliament(ary)?\b", r"\bcongress(ional)?\b",
-                  r"\bsenate\b", r"\bcongressman\b", r"\bgovernment\b", r"\bminister(s)?\b",
-                  r"\bpolitic(s|al|ian|ians)?\b", r"\bpolitical party\b", r"\bcampaign trail\b",
-                  r"\bvoting\b", r"\bvote(s|d)?\b", r"\bballot(s)?\b", r"\bpolicy debate\b",
-                  r"\bwhite house\b", r"\bdowning street\b", r"\bgeopolitic(s|al)?\b",
-                  r"\bceasefire talks\b", r"\bforeign minister\b", r"\bparliamentary vote\b",
-              ]
-              return any(re.search(pattern, text_value) for pattern in political_patterns)
-          
-          investigative_signal_terms = (
-              "epstein", "diddy", "sean combs", "bohemian grove", "scandal", "conspiracy",
-              "mystery", "fact check", "fact-check", "viral", "controversy", "allegation",
-              "lawsuit", "court", "documents", "leaked", "missing", "alive", "dead",
-              "disappearance", "unsolved", "cover-up", "hoax", "deepfake", "exposed",
-              "investigation", "internet", "celebrity", "influencer", "youtuber", "streamer",
-              "cult", "secret", "hidden", "documentary", "fraud", "case files"
-          )
-          signal_candidates = [
-              signal for signal in social_topic_signals
-              if not is_political_topic(signal)
-              and any(term in signal.lower() for term in investigative_signal_terms)
-              and not any(term in signal.lower() for term in (
-                  "official trailer", "music video", "official video", "new song",
-                  "new album", "minecraft", "gameplay", "reaction compilation",
-                  "fixtures", "premier league", "football", "fc ", "nascar", "snowfall totals",
-                  "tour dates", "transfer news"
-              ))
-          ]
-          topic_searches.extend(
-              signal + " controversy mystery claims evidence social media when:7d"
-              for signal in signal_candidates[:8]
-          )
-          
+          from html.parser import HTMLParser
+          import xml.etree.ElementTree as ET
           now = datetime.now(timezone.utc)
-          feeds = [
-              ("BBC World", "https://feeds.bbci.co.uk/news/world/rss.xml"),
-              ("BBC UK", "https://feeds.bbci.co.uk/news/uk/rss.xml"),
-              ("The Guardian World", "https://www.theguardian.com/world/rss"),
-              ("The Guardian Technology", "https://www.theguardian.com/technology/rss"),
-              ("NPR World", "https://feeds.npr.org/1004/rss.xml"),
-              ("Al Jazeera News", "https://www.aljazeera.com/xml/rss/all.xml"),
-          ]
-          for search_query in topic_searches[:18]:
-              feeds.append((
-                  "Social topic research: " + search_query.replace(" when:7d", "")[:85],
-                  "https://news.google.com/rss/search?q=" + quote(search_query) + "&hl=en-GB&gl=GB&ceid=GB:en"
-              ))
-          news_items = []
-          for source_name, feed_url in feeds:
-              try:
-                  feed_response = requests.get(
-                      feed_url,
-                      headers={"User-Agent": "SignalBrief/1.0 (current affairs research)"},
-                      timeout=20
-                  )
-                  feed_response.raise_for_status()
-                  root = ET.fromstring(feed_response.content)
-                  entries = root.findall(".//item")
-                  if not entries:
-                      entries = [node for node in root.iter() if node.tag.endswith("entry")]
-                  for entry in entries:
-                      def node_text(names):
-                          for node in entry.iter():
-                              if node.tag.split("}")[-1].lower() in names and node.text:
-                                  return node.text.strip()
-                          return ""
-                      headline = node_text({"title"})
-                      summary = node_text({"description", "summary", "encoded"})
-                      link = ""
-                      for node in entry.iter():
-                          if node.tag.split("}")[-1].lower() == "link":
-                              link = (node.attrib.get("href") or node.text or "").strip()
-                              if link:
-                                  break
-                      published = node_text({"pubdate", "published", "updated", "date"})
-                      try:
-                          published_at = parsedate_to_datetime(published)
-                          if published_at.tzinfo is None:
-                              published_at = published_at.replace(tzinfo=timezone.utc)
-                          published_at = published_at.astimezone(timezone.utc)
-                      except Exception:
-                          try:
-                              published_at = datetime.fromisoformat(published.replace("Z", "+00:00"))
-                              if published_at.tzinfo is None:
-                                  published_at = published_at.replace(tzinfo=timezone.utc)
-                              published_at = published_at.astimezone(timezone.utc)
-                          except Exception:
-                              published_at = now - timedelta(hours=12)
-                      summary = re.sub(r"<[^>]+>", " ", summary)
-                      summary = html.unescape(re.sub(r"\s+", " ", summary)).strip()
-                      if headline and link.startswith("http") and published_at >= now - timedelta(days=30):
-                          news_items.append({
-                              "source": source_name,
-                              "headline": headline,
-                              "summary": summary[:900],
-                              "url": link,
-                              "published": published_at.isoformat(),
-                              "published_dt": published_at,
-                          })
-                  print(f"Loaded current headlines from {source_name}.")
-              except Exception as error:
-                  print(f"News feed unavailable ({source_name}): {error}")
-          
-          unique_items = {}
-          for item in news_items:
-              key_title = re.sub(r"[^a-z0-9 ]", "", item["headline"].lower())
-              unique_items[(item["source"], key_title)] = item
-          news_items = sorted(unique_items.values(), key=lambda item: item["published_dt"], reverse=True)
-          if not news_items:
-              raise SystemExit("No current news feeds were available. Rerun the workflow later.")
-          
-          def headline_tokens(value):
-              ignored = {"the", "and", "for", "with", "from", "that", "this", "says", "after", "over", "into", "amid", "what", "why", "how", "its", "their", "has", "have", "are", "was", "were"}
-              return {word for word in re.findall(r"[a-z0-9]+", value.lower()) if len(word) > 2 and word not in ignored}
-          
-          investigative_terms = (
-              "epstein", "diddy", "sean combs", "bohemian grove", "conspiracy",
-              "mystery", "fact check", "fact-check", "viral claim", "misinformation",
-              "scandal", "controversy", "investigation", "unsealed", "court documents",
-              "leaked", "files", "cover-up", "alive", "missing", "debunked", "myth",
-              "rumour", "rumor", "allegation", "evidence", "secret", "hidden", "hoax",
-              "deepfake", "fraud", "lawsuit", "cult", "internet theory", "social media claim"
-          )
-          routine_entertainment_terms = (
-              "official trailer", "new trailer", "music video", "official video",
-              "new single", "new album", "album release", "release date", "teaser trailer",
-              "box office", "episode recap", "season premiere"
-          )
-          
-          def investigative_relevance(item):
-              combined = (item["headline"] + " " + item["summary"]).lower()
-              score = sum(3 for term in investigative_terms if term in combined)
-              if any(term in combined for term in ("epstein", "diddy", "sean combs", "bohemian grove")):
-                  score += 5
-              if any(term in combined for term in routine_entertainment_terms):
-                  score -= 7
-              return score
-          
-          for item in news_items:
-              own = headline_tokens(item["headline"] + " " + item["summary"])
-              corroborating = []
-              for other in news_items:
-                  if other is item or other["source"] == item["source"]:
-                      continue
-                  other_tokens = headline_tokens(other["headline"] + " " + other["summary"])
-                  overlap = len(own & other_tokens) / max(1, len(own | other_tokens))
-                  if overlap >= 0.22:
-                      corroborating.append(other)
-              item["corroborating"] = corroborating
-              item["story_score"] = len({other["source"] for other in corroborating})
-              item["investigative_relevance"] = investigative_relevance(item)
-          
-          # Avoid repeating topics already produced by this workflow. The history file
-          # is committed only after a successful upload, and starts with the user's
-          # existing reptilian-claim video so it is never selected again.
           history_path = Path("topic-history.json")
           try:
               history_data = json.loads(history_path.read_text(encoding="utf-8")) if history_path.exists() else {"topics": []}
           except Exception:
               history_data = {"topics": []}
-          previous_topics = [str(value) for value in history_data.get("topics", [])]
-          # Seed the known earlier story: the original upload predates persisted history.
-          previous_topics.append("Are U.S. Troops Fighting Reptilians? Investigating the Viral Fake Image")
-          previous_topics.append("Fact Check: FAKE Image Of U.S. Troops Shooting 'Reptilians' Is NOT Real Photo - Lead Stories")
+          previous_topics = [str(x) for x in history_data.get("topics", [])]
+          # These are DISCOVERY LEADS, not automatic video choices or an exhaustive list.
+          # They also allow evergreen documentaries when nothing broke in the news today.
+          category_leads = {
+              "morning": ["mothman sightings", "bigfoot evidence", "skinwalker folklore", "wendigo legend",
+                          "chupacabra reports", "jersey devil", "loch ness monster", "thunderbird cryptid",
+                          "dogman eyewitness reports", "flatwoods monster", "the rake internet cryptid",
+                          "black eyed children urban legend", "cryptid hoaxes", "almas folklore"],
+              "noon": ["lost media internet mystery", "unfiction internet mysteries", "internet hoax investigation",
+                       "creepy viral audio origins", "mysterious internet livestream", "ARG internet mystery",
+                       "creepypasta origins", "unidentified internet footage", "the backrooms origins",
+                       "disturbing online urban legends", "internet puzzle mystery", "strange radio broadcasts"],
+              "afternoon": ["unsolved wilderness disappearances", "dyatlov pass", "somerton man",
+                            "unidentified signals explained", "strange 911 call verified", "unexplained archaeological finds",
+                            "vanishing ships", "historical unexplained events", "unusual missing person case",
+                            "unidentified aerial phenomenon evidence", "mysterious historical recordings"],
+              "evening": ["area 51 history secrecy", "project blue book records", "mkultra documents",
+                          "secret societies history evidence", "mass surveillance revelations",
+                          "famous conspiracy theory fact check", "government archives declassified",
+                          "ufo coverup claims", "cold war covert operations", "internet cult investigations",
+                          "secret military testing historical", "major fraud conspiracy exposed"],
+              "night": ["deep ocean mystery science", "unexplained natural sounds", "strange cosmic signals",
+                        "bizarre true science experiments", "frightening geological phenomena",
+                        "strange abandoned structures", "unexplained lights sky science",
+                        "unusual animal discoveries", "strange old technology", "unknown ocean creatures",
+                        "weird science mysteries", "unexplained satellite signals"],
+          }
+          leads = category_leads.get(slot, category_leads["morning"])
+          # Recent social trends help discover new leads, but never prove a claim.
+          trend_titles = []
+          for region in ("GB", "US"):
+              try:
+                  response = requests.get(f"https://trends.google.com/trending/rss?geo={region}", timeout=12,
+                                          headers={"User-Agent": "Mozilla/5.0"})
+                  response.raise_for_status()
+                  for item in ET.fromstring(response.content).findall(".//item")[:35]:
+                      title_node = item.find("title")
+                      if title_node is not None and title_node.text:
+                          trend_titles.append(title_node.text.strip())
+              except Exception as exc:
+                  print(f"Trends unavailable for {region}: {exc}")
+          # Research a rotating spread rather than five narrowly related headlines.
+          offset = (now.date().toordinal() * 7) % len(leads)
+          rotated = (leads[offset:] + leads[:offset])[:11]
+          feed_requests = [("Topic research: " + term, "https://news.google.com/rss/search?q=" +
+                            quote(term + " (explained OR investigation OR history OR evidence) when:365d") +
+                            "&hl=en-GB&gl=GB&ceid=GB:en", term) for term in rotated]
+          # Collect broad sources and permit older background reporting; research breadth matters.
+          research_items = []
+          for source_name, feed_url, lead in feed_requests:
+              try:
+                  response = requests.get(feed_url, headers={"User-Agent": "SignalBrief/2.0"}, timeout=22)
+                  response.raise_for_status()
+                  root = ET.fromstring(response.content)
+                  for entry in root.findall(".//item")[:9]:
+                      def get_text(tag):
+                          node = entry.find(tag)
+                          return (node.text or "").strip() if node is not None else ""
+                      headline = get_text("title")
+                      url = get_text("link")
+                      summary = html.unescape(re.sub(r"<[^>]+>", " ", get_text("description")))
+                      date_str = get_text("pubDate")
+                      try:
+                          publish_dt = parsedate_to_datetime(date_str).astimezone(timezone.utc)
+                      except Exception:
+                          publish_dt = now - timedelta(days=180)
+                      if headline and url.startswith("https://"):
+                          research_items.append({"headline": headline, "summary": summary[:650],
+                              "url": url, "source": source_name, "published": publish_dt.isoformat(),
+                              "published_dt": publish_dt, "lead": lead})
+              except Exception as exc:
+                  print(f"Research feed unavailable for {lead}: {exc}")
+          if len(research_items) < 5:
+              raise SystemExit("Not enough accessible background reporting for this category; skip instead of inventing a documentary.")
+          candidate_records = []
+          for lead in rotated:
+              related = [i for i in research_items if i["lead"] == lead]
+              if len(related) >= 2:
+                  candidate_records.append({"lead": lead, "articles": [
+                      {k: article[k] for k in ("headline", "summary", "url", "source", "published")}
+                      for article in related[:5]]})
+          if not candidate_records:
+              raise SystemExit("Not enough researched candidate subjects; skip upload.")
+          editor_prompt = f"""You are a highly selective YouTube documentary commissioning editor.
+          This publishing slot covers ONLY: {category}.
+          Choose one BROAD, SELF-CONTAINED documentary subject from the research leads.
+          A video should fully introduce and explore a mystery, creature, case or phenomenon,
+          not be an obscure micro-update, random person's statement or episode on one tiny detail.
+          Prioritise immediate curiosity, recognisable visual anchors, real reusable location/object
+          photos, records and maps, investigative depth, and a compelling hook to strangers.
+          Consider present-day YouTube audience appeal without pretending to have view-count data.
+          Avoid politics as routine news, cheap allegations, filler, and celebrity gossip.
+          Keep claims distinct from evidence; do not present legends as fact.
+          HISTORY of already published subjects (DO NOT repeat any overall subject, spelling variants,
+          sequels, updates or closely related subtopics): {json.dumps(previous_topics[-250:])}
+          Candidate leads with verifiable background reports: {json.dumps(candidate_records, ensure_ascii=False)[:28000]}
+          Return ONLY JSON: {{"lead":"exact lead from supplied list","topic":"short whole-subject documentary topic","reason":"one sentence"}}.
+          If none is strong and genuinely distinct return {{"lead":null,"topic":null,"reason":"..."}}."""
+          response = gemini_post(
+              "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent",
+              headers={"x-goog-api-key": key},
+              json={"contents": [{"parts": [{"text": editor_prompt}]}],
+                    "generationConfig": {"temperature": 0.25, "maxOutputTokens": 400,
+                                         "responseMimeType": "application/json"}})
+          response.raise_for_status()
+          editor_text = "".join(x.get("text", "") for x in response.json()["candidates"][0]["content"]["parts"])
+          chosen = json.loads(editor_text)
+          chosen_lead = chosen.get("lead")
+          if chosen_lead not in {x["lead"] for x in candidate_records}:
+              raise SystemExit("Editorial check declined an eligible whole-topic documentary.")
+          topic = re.sub(r"\s+", " ", str(chosen.get("topic") or chosen_lead)).strip()[:115]
+          if len(topic) < 7:
+              raise SystemExit("Invalid documentary subject.")
+          def subject_tokens(value):
+              return {x for x in re.findall(r"[a-z0-9]+", value.lower()) if len(x) > 3 and x not in
+                      {"video", "investigation", "mystery", "explained", "evidence", "really", "about", "theory"}}
+          new_tokens = subject_tokens(topic + " " + chosen_lead)
+          for old in previous_topics:
+              old_tokens = subject_tokens(old)
+              if old_tokens and (len(new_tokens & old_tokens) / max(1, min(len(new_tokens),len(old_tokens))) > .64):
+                  raise SystemExit(f"Already covered a related whole subject: {old}")
+          # Read multiple pieces for the chosen WHOLE topic rather than only one headline.
+          selected_articles = [x for x in research_items if x["lead"] == chosen_lead]
+          news_items = sorted(selected_articles, key=lambda x: x["published_dt"], reverse=True)
+          related_items = news_items[:7]
+          print(f"Selected {category} documentary: {topic}; {len(related_items)} research leads")
+          (out / "category.txt").write_text(category, encoding="utf-8")
 
-          def topic_tokens(value):
-              ignored = {"the", "and", "for", "with", "from", "that", "this", "are", "was", "were", "what", "why", "how", "into", "about", "viral", "video", "investigating"}
-              return {word for word in re.findall(r"[a-z0-9]+", str(value).lower()) if len(word) > 2 and word not in ignored}
-
-          def already_covered(item):
-              candidate = topic_tokens(item["headline"] + " " + item.get("summary", ""))
-              headline = topic_tokens(item["headline"])
-              for previous in previous_topics:
-                  old = topic_tokens(previous)
-                  if not old or not headline:
-                      continue
-                  overlap = len(headline & old) / max(1, len(headline | old))
-                  containment = len(headline & old) / max(1, min(len(headline), len(old)))
-                  if overlap >= 0.42 or containment >= 0.72:
-                      print("Skipping previously covered topic: " + item["headline"] + " (matches history: " + previous + ")")
-                      return True
-              return False
-
-          news_items = [item for item in news_items if not already_covered(item)]
-          if not news_items:
-              raise SystemExit("All discovered stories match previously uploaded topics. Rerun later for fresh topics.")
-
-          social_research_items = [
-              item for item in news_items
-              if item["source"].startswith("Social topic research:")
-              and not is_political_topic(item["headline"] + " " + item["summary"])
-              and item["investigative_relevance"] >= 3
-          ]
-          
-          # General feeds can corroborate a chosen story, but should not cause
-          # the channel to drift into routine politics or government coverage.
-          non_political_items = [
-              item for item in news_items
-              if not is_political_topic(item["headline"] + " " + item["summary"])
-          ]
-          if not non_political_items:
-              raise SystemExit("No suitable recent non-political story had accessible reporting. Rerun later.")
-          
-          if social_research_items:
-              selected_item = max(
-                  social_research_items,
-                  key=lambda item: (
-                      item["story_score"],
-                      item["investigative_relevance"],
-                      item["published_dt"] >= now - timedelta(hours=24),
-                      item["published_dt"]
-                  )
-              )
-              print("Prioritising an investigative internet-culture story with recent reporting: " + selected_item["headline"])
-          else:
-              eligible_deep_dive_items = [
-                  item for item in non_political_items
-                  if item["investigative_relevance"] >= 3
-              ]
-              if not eligible_deep_dive_items:
-                  raise SystemExit(
-                      "No suitable investigative story about a major online controversy, mystery, "
-                      "scandal or disputed viral claim has enough recent reporting. The workflow will "
-                      "stop rather than create an unrelated routine news video. Rerun later."
-                  )
-              selected_item = max(
-                  eligible_deep_dive_items,
-                  key=lambda item: (
-                      item["story_score"],
-                      item["investigative_relevance"],
-                      item["published_dt"] >= now - timedelta(hours=24),
-                      item["published_dt"]
-                  )
-              )
-              print("Selected the strongest supported investigative story: " + selected_item["headline"])
-          related_items = [selected_item] + selected_item["corroborating"]
-          related_items = sorted(related_items, key=lambda item: item["published_dt"], reverse=True)[:6]
-          topic = selected_item["headline"]
-          
           class ArticleParser(HTMLParser):
               def __init__(self):
                   super().__init__(convert_charrefs=True)
@@ -595,22 +385,22 @@ jobs:
           )
           
           prompt = f"""You are the lead investigative video essay writer for SIGNAL BRIEF. Write like a sharp, modern YouTube documentary creator who is curious, sceptical, clear and engaging—not like a newsreader reading headlines.
-          Selected research lead: {topic}
+          Full documentary subject: {topic}\nCategory: {category}
           Current UTC date: {now.strftime('%Y-%m-%d')}
           
-          SOCIAL DISCUSSION SIGNALS (Google Trends and public Reddit discussions; discovery clues only, not evidence of factual claims):
-          {json.dumps(social_topic_signals[:35], ensure_ascii=False)}
+          TREND SIGNALS (only leads, never evidence):
+          {json.dumps(trend_titles[:35], ensure_ascii=False)}
           
-          SOURCE MATERIAL (recent news reports, dates, summaries, article excerpts and URLs; includes searches around high-discussion topics such as Epstein-related documents, the Diddy case, Bohemian Grove, and other current online controversies):
+          SOURCE MATERIAL (background research reports and their links; some claims can remain disputed):
           {research}
           
-          Choose an investigative QUESTION, not a routine news update. The channel covers major internet mysteries, high-profile scandals, celebrity/influencer controversies, public-record mysteries, viral claims, alleged cover-ups, strange online theories, and misconceptions that deserve a proper evidence-led deep dive. Example framing: “Is Jeffrey Epstein Still Alive? Investigating the Claims” is a better format than a generic headline about a new court update. Epstein, Diddy and Bohemian Grove are examples of subject areas, not automatic choices. Pick them only when the supplied signals and evidence make a meaningful investigation possible. Avoid politics, elections, government policy, and routine daily headlines. Do not pick a random music/video release merely because it is trending. Use social posts to identify what people are asking or getting wrong, never as proof. If no suitable deep-dive topic has credible sources, stop rather than publish an unrelated story.
-          
-          The narration MUST begin with this exact sentence, replacing the bracketed topic with the selected topic: “I am Signal Brief, and I will be discussing {topic}.” Immediately after that one-sentence identification, launch into the single most gripping, specific, evidence-grounded hook in the investigation. Do not add greetings, a long intro, or any other channel introduction. The hook should make the viewer want the answer without presenting an unproven claim as fact.
+          Write ONE satisfying full-subject documentary for the chosen category, not a breaking-news update or a small episode about a detail. Introduce the entire phenomenon/case/creature, its historical background, iconic sightings or documented milestones, popular interpretations, strongest evidence, hoaxes or counterarguments, and what remains uncertain. Lead with the most gripping documented visual or incident. Do not force an episode-like title, a series teaser or a repeated follow-up. Tell an original gripping story, not a dry fact-check bulletin. Distinguish legends, interpretations and confirmed facts at every step.
+
+          Begin with a startling, specific, well-supported QUESTION or detail about the mystery in the first 10 seconds. Do NOT say "I am Signal Brief" or "Today we'll be discussing". Explain unknown names in plain English before discussing them. Every passage must move the story forward; use a new reveal, a useful contradiction, or a clearer answer rather than filler. Never imply unverified allegations are established facts.
           
           Write 1,000–1,300 spoken words in natural British English, aiming for about 1,150. Structure the narration like a high-retention YouTube investigation:
-          1. After the required one-sentence channel identification, immediately open with the most gripping question or verified detail; no generic intro.
-          2. Explain the origin of the claim or mystery and why it spread online.
+          1. Open immediately with the most gripping question or verified detail; no generic channel intro.
+          2. Explain the origins and wider background of this whole subject and why it fascinates people.
           3. Build a clear timeline of the key events and the strongest available evidence.
           4. Examine the main arguments people use to support the popular theory, one by one, and explain what the evidence actually shows.
           5. Investigate common misconceptions, misleading clips/images, missing context, and claims that cannot be verified.
@@ -633,7 +423,7 @@ jobs:
             sources genuinely support the same event.
           - If source summaries disagree or details are missing, state that clearly instead of guessing.
           - Avoid sensationalism, partisan advocacy, graphic detail, and presenting speculation as fact.
-          - Do not use generic filler or a long channel introduction. Keep it specific to the central question and useful to viewers.
+          - Do not use generic filler or write your own channel introduction. Keep it specific to the central question and useful to viewers. A consistent branded intro and outro will be added separately after drafting.
           - Do not repeat the same fact to pad the word count. If evidence is limited, explain the limits rather than inventing detail.
           - End with a direct, nuanced answer to the opening question and identify what evidence would change that answer.
           - Return only spoken narration. No title, headings, bullet points, citations, stage directions,
@@ -676,7 +466,7 @@ jobs:
               SOURCE MATERIAL:
               {research}
           
-              SOCIAL DISCUSSION MATERIAL:
+              BACKGROUND DISCUSSION MATERIAL:
               {research if not social_discussion_items else json.dumps(social_discussion_items[:12], ensure_ascii=False)}
           
               CURRENT NARRATION:
@@ -718,15 +508,27 @@ jobs:
                   "Continuing because the draft is substantial and the evidence must not be padded."
               )
           
-          required_intro = f"I am Signal Brief, and I will be discussing {topic}."
-          script = re.sub(r"^\s*I am Signal Brief, and I will be discussing [^.]+\.\s*", "", script, flags=re.IGNORECASE)
-          script = required_intro + "\n\n" + script.lstrip()
+          script = re.sub(r"^\s*I am Signal Brief, and I will be discussing [^.]+\.\s*", "", script, flags=re.IGNORECASE).strip()
+          # Open with the story hook, then a SHORT recognisable channel ident.
+          # Inserting it into the narrated text (before TTS and caption alignment)
+          # keeps spoken audio, subtitles and scene timings in sync.
+          hook_match = re.search(r"[.!?](?:[\"'”’])?(?=\s|$)", script)
+          if hook_match:
+              cut = hook_match.end()
+              hook, rest = script[:cut].strip(), script[cut:].strip()
+              script = hook + "\n\nYou're watching Signal Brief. Let's follow the evidence.\n\n" + rest
+          else:
+              script += "\n\nYou're watching Signal Brief. Let's follow the evidence."
+          # An outro at the actual end of narration, not a silent extra video segment.
+          script += ("\n\nThat's the evidence so far. This is Signal Brief. "
+                     "For more investigations that separate fact from fiction, "
+                     "subscribe, and I'll see you in the next one.")
           word_count = len(script.split())
           (out / "script.txt").write_text(script, encoding="utf-8")
-          print(f"Investigative narration generated with required Signal Brief opening: {word_count} words.")
+          print(f"Investigative narration generated: {word_count} words.")
           
           title_prompt = f"""Create one accurate, compelling YouTube title for this SIGNAL BRIEF investigative video essay.
-          Prefer a clear question followed by an investigation framing, such as 'Is [claim] True? Investigating the Evidence' or 'What Really Happened to [subject]?'. Do not copy a news headline, do not use ALL CAPS, and do not imply a claim is true if the script investigates it. Make it intriguing but not misleading, ideally 45–75 characters and no more than 95 characters. Return only the title, with no quotation marks or explanation.
+          Describe the central WHOLE subject and universally understandable mystery, NOT an obscure person's name or a tiny subtopic. This is one complete standalone documentary. Prefer a curiosity-generating question with clear, concrete stakes. Do not copy a news headline, do not use ALL CAPS, and do not imply a claim is true if the script investigates it. Make it intriguing but not misleading, ideally 45–75 characters and no more than 95 characters. Return only the title, with no quotation marks or explanation.
           Research lead: {topic}
           Narration: {script[:9000]}"""
           title_response = gemini_post(
@@ -750,6 +552,43 @@ jobs:
           (out / "video-title.txt").write_text(video_title, encoding="utf-8")
           print("Generated investigative title: " + video_title)
           
+          # Generate searchable metadata specific to the actual script, not generic spam.
+          metadata_prompt = f"""Produce VALID JSON with keys description (2 engaging, accurate
+          sentences explaining this exact video without spoilers), hashtags (3 relevant hashtag
+          strings starting #), and tags (12-18 relevant YouTube search phrases).
+          Cover this topic: {topic}
+          Title: {video_title}
+          Narration: {script[:9500]}
+          Rules: No fabricated popularity, unrelated popular people, false accusations,
+          generic trending tags, keyword stuffing or sensationalising unproven claims.
+          Every hashtag and search phrase must directly describe this video's subject,
+          closely related terms, or its evidence-based approach. Avoid repetition.
+          Return JSON only."""
+          metadata_response = gemini_post(
+              "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent",
+              headers={"x-goog-api-key": key},
+              json={"contents": [{"parts": [{"text": metadata_prompt}]}],
+                    "generationConfig": {"temperature": 0.3, "maxOutputTokens": 650,
+                                         "responseMimeType": "application/json"}},
+          )
+          metadata_response.raise_for_status()
+          metadata_text = "".join(part.get("text", "") for part in metadata_response.json()["candidates"][0]["content"]["parts"])
+          metadata_data = json.loads(metadata_text)
+          clean_hashtags = []
+          for value in metadata_data.get("hashtags", []):
+              value = "#" + re.sub(r"[^A-Za-z0-9_]", "", str(value).lstrip("#"))
+              if len(value) > 2 and value.casefold() not in {x.casefold() for x in clean_hashtags}:
+                  clean_hashtags.append(value)
+          clean_tags = []
+          for value in metadata_data.get("tags", []):
+              value = re.sub(r"\s+", " ", str(value)).strip(" ,#")[:60]
+              if len(value) >= 3 and value.casefold() not in {x.casefold() for x in clean_tags}:
+                  clean_tags.append(value)
+          (out / "video-metadata.json").write_text(json.dumps({
+              "description": str(metadata_data.get("description", ""))[:700],
+              "hashtags": clean_hashtags[:3], "tags": clean_tags[:18]
+          }, ensure_ascii=False, indent=2), encoding="utf-8")
+
           payload = {
               "contents": [{"parts": [{"text": script}]}],
               "generationConfig": {
@@ -757,7 +596,7 @@ jobs:
                   "speechConfig": {
                       "voiceConfig": {
                           "prebuiltVoiceConfig": {
-                              "voiceName": "Kore"
+                              "voiceName": "Charon"
                           }
                       }
                   }
@@ -807,11 +646,11 @@ jobs:
           
           visual_prompt = f"""You are the visual researcher and editor for a modern, high-quality investigative YouTube documentary for SIGNAL BRIEF.
           Return ONLY valid JSON:
-          {{"scenes":[{{"index":1,"keyword":"specific subject, not an isolated verb","title":"what the viewer should actually see","visual_subject":"concrete visual subject in plain language","visual_intent":"why this visual fits this exact narration passage","query":"specific photographic search phrase","avoid":"misleading or unrelated visual types"}}]}}
+          {{"scenes":[{{"index":1,"keyword":"specific subject, not an isolated verb","title":"what the viewer should actually see","visual_subject":"concrete visual subject in plain language","visual_intent":"why this visual fits this exact narration passage","query":"specific named-place or documented-object photo search phrase","avoid":"misleading or unrelated visual types"}}]}}
           Create exactly one visual beat for every narration passage, preserving all indices and order. Read the ENTIRE investigation topic and each passage together before deciding what the image should depict. Understand references, pronouns, irony, metaphors, allegations, and the sentence's actual subject. Never match an image to a single word in isolation.
           The visual must represent the central SUBJECT or EVIDENCE being discussed in that exact passage. Example: if the investigation discusses a conspiracy theory about a reptilian race allegedly seeking to destroy the world, the word “destroy” does NOT mean search for a burning building. Choose a clearly illustrative reptilian-humanoid/conspiracy-culture visual, the person or source making the claim, or the specific document/post being discussed. Never present a fictional or alleged event as proven fact.
-          Identify the passage's role (claim, person, location, document, timeline, evidence, counterargument, or conclusion), then choose the most informative visual for that role. Prefer directly relevant people, named places, real documents, screenshots or public records when available. Use illustrations only when suitable to explain a theory or abstract idea. Do not use generic disaster, fire, courtroom, city, or “mysterious” stock images just because a verb or mood suggests them. Never imply a generic image depicts the actual event.
-          The keyword, visual_subject, and query must describe the SAME thing. The query must be a short, FINDABLE image-search phrase (usually 2–5 words), not a description of a hypothetical website screen or made-up screenshot. Prefer subjects that really have reusable photos: U.S. military training, journalists working, an ordinary smartphone, a television newsroom, computer image editing, computer displays, archive files, and genuine named people or places. Do NOT search for the exact viral fake image as if it were verified evidence. A REAL, clearly illustrative shot of the investigation's subject is better than an impossible "computer showing the precise article" request. For abstract passages, reuse a recurring visual theme (reporting, phones, investigations) rather than inventing a specific document or interface. Make sure visual subjects vary across the film. Image beats must be at least 1.0 second apart; timings are based on narration audio. Current investigation: {topic}
+          Identify the passage's role (claim, person, location, document, timeline, evidence, counterargument, or conclusion), then choose the most informative visual for that role. Demand exact visual anchors first: named locations and entrances, warning signs, real photographs of alleged physical traces, historical figures, public-domain records, newspaper archives and labelled maps when available. Prefer directly relevant people, named places, real documents, screenshots or public records when available. Use illustrations only when suitable to explain a theory or abstract idea. Do not use generic disaster, fire, courtroom, city, or “mysterious” stock images just because a verb or mood suggests them. Never imply a generic image depicts the actual event.
+          The keyword, visual_subject, and query must describe the SAME thing. The query must be a short, FINDABLE image-search phrase (usually 2–5 words), not a description of a hypothetical website screen or made-up screenshot. Prefer subjects that really have reusable photos: U.S. military training, journalists working, an ordinary smartphone, a television newsroom, computer image editing, computer displays, archive files, and genuine named people or places. Do NOT search for the exact viral fake image as if it were verified evidence. A REAL, clearly illustrative shot of the investigation's subject is better than an impossible "computer showing the precise article" request. For abstract passages, reuse a recurring visual theme (reporting, phones, investigations) rather than inventing a specific document or interface. Re-use important evidence images with new crops intentionally rather than showing random substitutes. Make sure visual subjects vary across the film. Image beats must be at least 1.0 second apart; timings are based on narration audio. Current investigation: {topic}
           
           PASSAGES:
           """
@@ -1244,7 +1083,7 @@ jobs:
                   if len(tokens(value)) >= 2 and key_value not in seen:
                       result.append(value)
                       seen.add(key_value)
-              return result[:2]  # Avoid excessive API calls and rate-limiting.
+              return result[:3]  # Seek more exact visual anchors before settling for fallback.
           
           def download_candidate(candidate):
               request = urllib.request.Request(
@@ -1278,7 +1117,7 @@ jobs:
                   return None
               prompt = (
                   "Inspect the actual image(s) and select a visually interesting, FACTUALLY HONEST supporting visual. "
-                  "A direct photo of the specific documented person/place/object is best, but ordinary relevant documentary B-ROLL "
+                  "Give priority to the actual documented place, entrance, warning sign, object or damage when verified by the image metadata. Exact evidence must be separately authenticated: image similarity is not proof. A direct photo of the specific documented person/place/object is best, but ordinary relevant documentary B-ROLL "
                   "(a phone being used during discussion of viral posts, reporters during discussion of fact-checking, "
                   "soldiers during discussion of the real U.S. military) is ALLOWED as an *illustration*, not as proof "
                   "of the viral allegation. NEVER claim an illustrative shot is evidence, footage of an alleged event, "
@@ -1699,7 +1538,10 @@ jobs:
               encoding="utf-8"
           )
           (out / "duration.txt").write_text(str(duration), encoding="utf-8")
-          print(f"Prepared script, narration and {len(attribution)} scene-matched visuals.")
+          licensed_count = sum(1 for item in attribution if item.get("license") not in ("Original graphic", "AI-generated illustration"))
+          if licensed_count < max(5, int(len(attribution) * 0.18)):
+              raise SystemExit(f"Insufficient real/contextual visual anchors: {licensed_count}/{len(attribution)}. Skip rather than publishing a generic slideshow.")
+          print(f"Prepared script, narration and {len(attribution)} scene-matched visuals; {licensed_count} sourced images.")
           PY
 
           python build.py
@@ -2012,118 +1854,134 @@ jobs:
           print(f"Music duration: {duration:.1f} seconds.")
           PY
 
-      - name: Assemble MP4 reliably (small scene clips, not a giant filter graph)
+      - name: Assemble MP4 with cinematic motion and crossfades
         run: |
           set -euo pipefail
 
-          python - <<'PY_RENDER'
+          python - <<'PY'
           import json
           import subprocess
           from pathlib import Path
 
           out = Path("output")
           scenes = json.loads((out / "scene-timings.json").read_text(encoding="utf-8"))
-          duration = float((out / "duration.txt").read_text(encoding="utf-8").strip())
-          frames_per_second = 24
-          clips = out / "render-parts"
-          clips.mkdir(parents=True, exist_ok=True)
-          render_log = out / "render-log.txt"
-          render_log.write_text("Reliable per-scene rendering log\n", encoding="utf-8")
+          duration = float((out / "duration.txt").read_text().strip())
+          transition = 0.65
+          command = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y"]
 
-          def run_ffmpeg(args, label):
-              # Capture useful error output, not just an enormous command traceback.
-              process = subprocess.run(
-                  args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                  text=True, errors="replace", check=False
+          for index, scene in enumerate(scenes):
+              clip_duration = float(scene["duration"])
+              if index > 0:
+                  clip_duration += transition
+              command.extend([
+                  "-loop", "1",
+                  "-framerate", "24",
+                  "-t", f"{clip_duration:.4f}",
+                  "-i", str(out / "images" / scene["file"])
+              ])
+
+          narration_index = len(scenes)
+          music_index = len(scenes) + 1
+          command.extend(["-i", str(out / "narration.wav"), "-i", str(out / "background-music.wav")])
+
+          filters = []
+          for index, scene in enumerate(scenes):
+              clip_duration = float(scene["duration"]) + (transition if index > 0 else 0)
+              filters.append(
+                  f"[{index}:v]"
+                  "scale=2000:1125:force_original_aspect_ratio=increase,"
+                  "crop=2000:1125,"
+                  "zoompan=z='min(zoom+0.00065,1.10)':"
+                  "x='(iw-iw/zoom)/2+sin(on/95)*18':"
+                  "y='(ih-ih/zoom)/2+cos(on/115)*12':"
+                  "d=1:s=1920x1080:fps=24,"
+                  "setsar=1,format=yuv420p,settb=AVTB,setpts=PTS-STARTPTS,"
+                  f"trim=duration={clip_duration:.4f}[v{index}]"
               )
-              with render_log.open("a", encoding="utf-8") as log:
-                  log.write(f"\n[{label}] exit={process.returncode}\n")
-                  log.write(process.stderr[-14000:] + "\n")
-              if process.returncode:
-                  excerpt = "\n".join(process.stderr.splitlines()[-35:])
-                  raise SystemExit(
-                      f"Video render failed at {label} (exit code {process.returncode}). "
-                      f"FFmpeg output:\n{excerpt}\nDetailed log: {render_log}"
+
+          if len(scenes) == 1:
+              current_video = "v0"
+          else:
+              current_video = "v0"
+              cumulative = float(scenes[0]["duration"])
+              for index in range(1, len(scenes)):
+                  next_label = f"xf{index}"
+                  offset = max(0.0, cumulative - transition)
+                  filters.append(
+                      f"[{current_video}][v{index}]"
+                      f"xfade=transition=fade:duration={transition:.3f}:offset={offset:.4f}"
+                      f"[{next_label}]"
                   )
+                  current_video = next_label
+                  cumulative += float(scenes[index]["duration"])
 
-          if not scenes:
-              raise SystemExit("Cannot render: scene-timings.json has no scenes.")
-
-          # Use cumulative frame boundaries so rounding errors do not build up.
-          frame_counts = []
-          elapsed = 0.0
-          previous_frame = 0
-          for scene in scenes:
-              elapsed += float(scene["duration"])
-              next_frame = round(elapsed * frames_per_second)
-              frame_counts.append(max(1, next_frame - previous_frame))
-              previous_frame = next_frame
-
-          concat_file = out / "scene-clips.ffconcat"
-          concat_lines = ["ffconcat version 1.0"]
-          for index, (scene, number_of_frames) in enumerate(zip(scenes, frame_counts), start=1):
-              image_path = out / "images" / scene["file"]
-              if not image_path.is_file() or image_path.stat().st_size < 1000:
-                  raise SystemExit(f"Missing or invalid image for scene {index}: {image_path}")
-              clip_path = clips / f"scene-{index:03d}.mp4"
-              print(f"Rendering scene {index}/{len(scenes)} ({number_of_frames} frames).", flush=True)
-              run_ffmpeg([
-                  "ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "error", "-y",
-                  "-loop", "1", "-framerate", str(frames_per_second),
-                  "-i", str(image_path),
-                  "-vf", (
-                      "scale=1280:720:force_original_aspect_ratio=increase,"
-                      "crop=1280:720,setsar=1,format=yuv420p,"
-                      "drawbox=x=0:y=0:w=iw:h=66:color=black@0.62:t=fill,"
-                      "drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:"
-                      "text='SIGNAL BRIEF':fontcolor=white:fontsize=28:x=42:y=17"
-                  ),
-                  "-frames:v", str(number_of_frames),
-                  "-an", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
-                  "-r", str(frames_per_second), "-pix_fmt", "yuv420p",
-                  "-threads", "2", str(clip_path)
-              ], f"scene {index}")
-              concat_lines.append(f"file 'render-parts/{clip_path.name}'")
-
-          concat_file.write_text("\n".join(concat_lines) + "\n", encoding="utf-8")
           fade_start = max(0.0, duration - 3.0)
-          filters = (
-              "[0:v]subtitles=output/captions.srt:"
-              "force_style='FontName=DejaVu Sans,FontSize=20,Outline=2,Shadow=1,Alignment=2,MarginV=44'[video];"
-              "[1:a]aformat=sample_fmts=fltp:channel_layouts=stereo,volume=1.0[narration];"
-              f"[2:a]aformat=sample_fmts=fltp:channel_layouts=stereo,volume=0.24,"
-              f"afade=t=out:st={fade_start:.3f}:d=3[music];"
-              "[narration][music]amix=inputs=2:duration=first:dropout_transition=2[audio]"
+          filters.append(
+              f"[{current_video}]"
+              "drawbox=x=0:y=0:w=iw:h=96:color=black@0.62:t=fill,"
+              "drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:"
+              "text='SIGNAL BRIEF':fontcolor=white:fontsize=36:x=64:y=27:"
+              "borderw=1:bordercolor=black@0.7,"
+              "drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:"
+              "text='SIGNAL BRIEF':fontcolor=white:fontsize=76:"
+              "x=(w-text_w)/2:y=(h-text_h)/2-35:"
+              "borderw=4:bordercolor=black@0.80:enable='between(t,0,3)',"
+              "drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf:"
+              "text='THE CLAIM. THE EVIDENCE. THE TRUTH.':"
+              "fontcolor=white:fontsize=31:x=(w-text_w)/2:y=(h-text_h)/2+60:"
+              "borderw=3:bordercolor=black@0.8:enable='between(t,0,3)',"
+              "drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:"
+              "text='SUBSCRIBE FOR MORE INVESTIGATIONS':"
+              "fontcolor=white:fontsize=46:x=(w-text_w)/2:y=(h-text_h)/2:"
+              f"borderw=4:bordercolor=black@0.8:enable='gte(t,{max(0.0, duration-5.0):.3f})'"
+              "[branded]"
           )
-          print("Combining scene clips, aligned subtitles, narration and background music.", flush=True)
-          run_ffmpeg([
-              "ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "error", "-y",
-              "-f", "concat", "-safe", "0", "-i", str(concat_file),
-              "-i", str(out / "narration.wav"),
-              "-i", str(out / "background-music.wav"),
-              "-filter_complex", filters,
-              "-map", "[video]", "-map", "[audio]",
-              "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
-              "-r", str(frames_per_second), "-pix_fmt", "yuv420p",
-              "-c:a", "aac", "-b:a", "160k", "-threads", "2",
-              "-t", f"{duration:.3f}", "-movflags", "+faststart",
-              str(out / "signal-brief.mp4")
-          ], "final assembly")
-          print("Reliable video rendering completed successfully.")
-          # Only keep the final video, not dozens of intermediate clips.
-          import shutil
-          shutil.rmtree(clips, ignore_errors=True)
-          concat_file.unlink(missing_ok=True)
-          PY_RENDER
+          filters.append(
+              "[branded]subtitles=output/captions.srt:"
+              "force_style='FontName=Arial,FontSize=22,Outline=2,Shadow=1,Alignment=2,MarginV=55'"
+              "[video]"
+          )
+          # Normalise speech for consistent listening volume. Procedural synth music
+          # has low raw amplitude, so normalise its loudness BEFORE mixing.
+          # Side-chain ducking automatically softens music while narration speaks
+          # and lets it rise between sentences (including the intro/outro).
+          filters.append(
+              f"[{narration_index}:a]aformat=sample_fmts=fltp:channel_layouts=stereo,"
+              "loudnorm=I=-16:TP=-1.5:LRA=9,asplit=2[narration_mix][narration_duck]"
+          )
+          filters.append(
+              f"[{music_index}:a]aformat=sample_fmts=fltp:channel_layouts=stereo,"
+              "highpass=f=55,loudnorm=I=-22:TP=-3:LRA=9,volume=0.80,"
+              f"afade=t=in:st=0:d=1.5,afade=t=out:st={fade_start:.3f}:d=3[musicbed]"
+          )
+          filters.append(
+              "[musicbed][narration_duck]sidechaincompress=threshold=0.045:ratio=5:"
+              "attack=100:release=550:makeup=1[duckedmusic]"
+          )
+          filters.append(
+              "[narration_mix][duckedmusic]amix=inputs=2:duration=first:"
+              "dropout_transition=0:normalize=0,alimiter=limit=0.94[audio]"
+          )
 
-      - name: Upload render diagnostics on failure
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: signal-brief-render-debug
-          path: output/render-log.txt
-          if-no-files-found: ignore
-          retention-days: 7
+          command.extend([
+              "-filter_complex", ";".join(filters),
+              "-map", "[video]",
+              "-map", "[audio]",
+              "-c:v", "libx264",
+              "-preset", "ultrafast",
+              "-crf", "22",
+              "-r", "24",
+              "-c:a", "aac",
+              "-b:a", "160k",
+              "-t", f"{duration:.3f}",
+              "-movflags", "+faststart",
+              str(out / "signal-brief.mp4")
+          ])
+
+          print(f"Rendering {len(scenes)} fast-cut, narration-matched scenes with persistent SIGNAL BRIEF branding, narration-aligned subtitles, and background music.")
+          subprocess.run(command, check=True)
+          print("Cinematic edit completed.")
+          PY
 
       - name: Validate final video
         run: |
@@ -2201,11 +2059,23 @@ jobs:
           if len(title) > 98:
               title = title[:95].rstrip() + "..."
           news_sources = json.loads((out / "news-sources.json").read_text(encoding="utf-8"))
+          video_metadata = json.loads((out / "video-metadata.json").read_text(encoding="utf-8"))
+          search_tags = video_metadata.get("tags", [])
+          # YouTube video tag field has an overall size limit. Reserve some space.
+          safe_tags = []
+          for tag in search_tags:
+              if len(",".join(safe_tags + [tag]).encode("utf-8")) > 440:
+                  break
+              safe_tags.append(tag)
 
           description_lines = [
-              "SIGNAL BRIEF | Investigations, internet mysteries and the evidence behind viral claims.",
+              video_metadata.get("description", ""),
               "",
-              "An evidence-led investigation based on the sources listed below. Online claims are assessed against available records and reporting; uncertainty is stated where evidence is incomplete.",
+              " ".join(video_metadata.get("hashtags", [])[:3]),
+              "",
+              "SIGNAL BRIEF | Cryptids, strange phenomena, internet mysteries and evidence-led documentaries.",
+              "",
+              "An original documentary based on the sources listed below. Legends and speculation are distinguished from verifiable records.",
               "",
               "NEWS SOURCES",
           ]
@@ -2266,7 +2136,7 @@ jobs:
           # Only explicitly marked dispatches schedule a YouTube release.
           # The GitHub UI's default 'private' choice remains safe for testing.
           publish_slot = os.environ.get("PUBLISH_SLOT", "private").strip().lower()
-          slot_to_hour = {"noon": 12, "afternoon": 17, "evening": 20}
+          slot_to_hour = {"morning": 10, "noon": 13, "afternoon": 16, "evening": 19, "night": 22}
           if publish_slot not in slot_to_hour and publish_slot != "private":
               raise SystemExit(f"Invalid publication slot: {publish_slot!r}")
           scheduled_publish_at = None
@@ -2291,6 +2161,7 @@ jobs:
                   "snippet": {
                       "title": title,
                       "description": description,
+                      "tags": safe_tags,
                       "categoryId": "27",
                       "defaultLanguage": "en-GB",
                   },
