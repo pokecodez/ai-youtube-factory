@@ -599,7 +599,7 @@ jobs:
                   "speechConfig": {
                       "voiceConfig": {
                           "prebuiltVoiceConfig": {
-                              "voiceName": "Kore"
+                              "voiceName": "Charon"
                           }
                       }
                   }
