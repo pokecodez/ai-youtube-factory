@@ -54,8 +54,8 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
           PIXABAY_API_KEY: ${{ secrets.PIXABAY_API_KEY }}
-          ENABLE_AI_IMAGES: "false"  # Change to "true" after enabling paid Gemini image generation.
-          MAX_AI_IMAGES_PER_VIDEO: "18"
+          ENABLE_AI_IMAGES: "true"  # Gemini AI visuals are ON by default for creature reconstructions and missing exact visuals.
+          MAX_AI_IMAGES_PER_VIDEO: "24"
           PUBLISH_SLOT: ${{ inputs.publish_slot || 'private' }}
         run: |
           set -euo pipefail
@@ -661,14 +661,35 @@ jobs:
 
           
           
-          visual_prompt = f"""You are the visual researcher and editor for a modern, high-quality investigative YouTube documentary for SIGNAL BRIEF.
+          visual_prompt = f"""You are the visual producer for a high-retention YouTube mystery documentary. Think like a HUMAN editor planning memorable, specific shots.
           Return ONLY valid JSON:
-          {{"scenes":[{{"index":1,"keyword":"specific subject, not an isolated verb","title":"what the viewer should actually see","visual_subject":"concrete visual subject in plain language","visual_intent":"why this visual fits this exact narration passage","query":"specific named-place or documented-object photo search phrase","avoid":"misleading or unrelated visual types"}}]}}
-          Create exactly one visual beat for every narration passage, preserving all indices and order. Read the ENTIRE investigation topic and each passage together before deciding what the image should depict. Understand references, pronouns, irony, metaphors, allegations, and the sentence's actual subject. Never match an image to a single word in isolation.
-          The visual must represent the central SUBJECT or EVIDENCE being discussed in that exact passage. Example: if the investigation discusses a conspiracy theory about a reptilian race allegedly seeking to destroy the world, the word “destroy” does NOT mean search for a burning building. Choose a clearly illustrative reptilian-humanoid/conspiracy-culture visual, the person or source making the claim, or the specific document/post being discussed. Never present a fictional or alleged event as proven fact.
-          Identify the passage's role (claim, person, location, document, timeline, evidence, counterargument, or conclusion), then choose the most informative visual for that role. Demand exact visual anchors first: named locations and entrances, warning signs, real photographs of alleged physical traces, historical figures, public-domain records, newspaper archives and labelled maps when available. Prefer directly relevant people, named places, real documents, screenshots or public records when available. Use illustrations only when suitable to explain a theory or abstract idea. Do not use generic disaster, fire, courtroom, city, or “mysterious” stock images just because a verb or mood suggests them. Never imply a generic image depicts the actual event.
-          The keyword, visual_subject, and query must describe the SAME thing. The query must be a short, FINDABLE image-search phrase (usually 2–5 words), not a description of a hypothetical website screen or made-up screenshot. Prefer subjects that really have reusable photos: U.S. military training, journalists working, an ordinary smartphone, a television newsroom, computer image editing, computer displays, archive files, and genuine named people or places. Do NOT search for the exact viral fake image as if it were verified evidence. A REAL, clearly illustrative shot of the investigation's subject is better than an impossible "computer showing the precise article" request. For abstract passages, reuse a recurring visual theme (reporting, phones, investigations) rather than inventing a specific document or interface. Re-use important evidence images with new crops intentionally rather than showing random substitutes. Make sure visual subjects vary across the film. Image beats must be at least 1.0 second apart; timings are based on narration audio. Current investigation: {topic}
-          
+          {{"scenes":[{{"index":1,"keyword":"specific subject, not an isolated verb","title":"what the viewer should actually see","visual_subject":"concrete visual subject in plain language","visual_intent":"why this visual fits this exact narration passage","query":"best real-world search phrase when a real asset is preferable","asset_type":"one of real_location, real_person, real_object, real_document, map_or_archive, contextual_broll, ai_creature, ai_reconstruction, ai_atmosphere","priority":"hero, evidence, support, transition","must_show":"specific visual details the image should contain","avoid":"misleading or unrelated visual types"}}]}}
+          Create exactly one visual beat for every narration passage, preserving all indices and order. Read the ENTIRE investigation topic and each passage together before deciding what the audience most wants to SEE. Never match an image to a single word in isolation.
+          Use this decision logic for every scene:
+          1. Ask: what is the HERO visual here?
+          2. Prefer exact visual anchors when they exist: the named location, entrance, warning sign, witness object, damage, physical trace, map, newspaper archive, transcript, old illustration, or famous public-domain image.
+          3. If the narration is about a legendary creature, alleged encounter, unseen event, creepy atmosphere, or a moment where no reliable exact photo is likely to exist, choose AI ON PURPOSE using asset_type ai_creature, ai_reconstruction or ai_atmosphere.
+          4. If a real photo would be weak, generic or misleading, DO NOT force it. A strong AI reconstruction is better than irrelevant filler.
+          5. Avoid filler like random paper, random feathers, generic forest leaves, generic spooky hallways, or unrelated objects unless that object is the actual evidence being discussed.
+          Think in shot types. Use many HERO shots, not just support shots:
+          - Cryptids/creatures: the creature itself, labelled as an editorial reconstruction, plus the real forest/town/location.
+          - Famous places or secret sites: the entrance, gate, warning signs, satellite-style maps, runways, buildings, road approach.
+          - Historical legends: old illustrations, maps, archival clippings, location shots, and dramatic AI reconstructions.
+          - Evidence scenes: real damage, footprints, documents, transcripts, newspaper clips, witness sketches, police or emergency-call context.
+          - Explanation scenes: maps, timelines, archive material, or contextual b-roll.
+          The asset_type must reflect the best strategy:
+          - real_location: a real named place, entrance, gate, sign, building, landscape.
+          - real_person: a real named person or witness.
+          - real_object: a real physical object, damage, footprint, truck bed, sign, artefact.
+          - real_document: transcript, poster, newspaper, report, document, sketch.
+          - map_or_archive: old map, archive imagery, town marker, route map, historical illustration.
+          - contextual_broll: only when exact visuals are not necessary for that sentence.
+          - ai_creature: use when the audience should see the legendary creature itself.
+          - ai_reconstruction: use for an alleged encounter or scene with no trustworthy exact photo.
+          - ai_atmosphere: use for eerie place-establishing shots when exact visuals are not available or not strong enough.
+          The query, keyword and visual_subject must describe the SAME thing. The query should be short and findable when a real asset is preferred. For AI-led scenes, the query may still point to the real location while the asset_type tells the system to generate the creature or reconstruction.
+          Re-use important hero visuals intentionally with different crops rather than wandering into random filler. The goal is a sequence that feels hand-edited, specific and cinematic. Current investigation: {topic}
+
           PASSAGES:
           """
           script_words = script.split()
@@ -1010,19 +1031,27 @@ jobs:
               print(f"Image search {search_query!r}: {len(stock_cache[cache_key])} candidates by source {by_source}")
               return stock_cache[cache_key]
 
-          # Final fallback uses Gemini image generation (requires billing). No fake evidence.
-          def generate_illustration(path, scene_title, visual_subject, passage_text):
+          # Gemini image generation for scenes that need a deliberate editorial reconstruction.
+          def generate_illustration(path, scene_title, visual_subject, passage_text, asset_type="", must_show="", priority=""):
               if not enable_ai_images:
                   return False
               from PIL import ImageOps, ImageDraw, ImageFont
+              style_hint = {
+                  "ai_creature": "Show the creature clearly as the hero of the frame in a cinematic documentary style.",
+                  "ai_reconstruction": "Create a dramatic but believable reconstruction of the alleged encounter, clearly editorial rather than evidentiary.",
+                  "ai_atmosphere": "Create a strong atmospheric establishing shot tied closely to the subject and location.",
+              }.get(asset_type, "Create a cinematic editorial illustration.")
               prompt = (
-                  "Create a landscape 16:9 editorial illustration to accompany a factual documentary. "
-                  "Visualise the subject symbolically and generically, not as a claimed authentic photo or screenshot. "
-                  "Never impersonate real news screenshots, fabricate documents or invent proof of allegations. "
-                  "If named people or real alleged incidents are mentioned, show neutral objects/settings instead. "
-                  "High-quality cinematic editorial illustration, no words, no logos, no watermark. "
-                  f"Investigation: {topic[:160]}. Scene: {scene_title[:150]}. "
-                  f"Subject: {visual_subject[:150]}. Narration: {passage_text[:280]}"
+                  "Create a landscape 16:9 editorial image for a YouTube documentary. "
+                  "Think like a human editor choosing a powerful hero visual, not generic filler. "
+                  "This image must feel specific to the story and visually memorable. "
+                  "Never impersonate a real news screenshot, fabricate documents, or pretend the image is evidence. "
+                  "If the topic is legendary or disputed, make that clear through a reconstruction or atmospheric editorial style. "
+                  f"{style_hint} "
+                  "No on-image text, no logos, no watermark. "
+                  f"Investigation: {topic[:160]}. Scene title: {scene_title[:150]}. "
+                  f"Visual subject: {visual_subject[:180]}. Priority: {priority[:30]}. Asset type: {asset_type[:40]}. "
+                  f"Must show: {must_show[:200]}. Narration context: {passage_text[:320]}"
               )
               for attempt in range(2):
                   try:
@@ -1055,13 +1084,27 @@ jobs:
                       draw = ImageDraw.Draw(generated)
                       font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
                       font = ImageFont.truetype(font_path, 25)
-                      draw.rounded_rectangle((1500, 100, 1870, 165), radius=10, fill=(15, 18, 25))
-                      draw.text((1522, 116), "AI ILLUSTRATION", font=font, fill=(240, 243, 248))
+                      draw.rounded_rectangle((1440, 100, 1870, 165), radius=10, fill=(15, 18, 25))
+                      label = "EDITORIAL RECONSTRUCTION" if asset_type in {"ai_creature", "ai_reconstruction"} else "EDITORIAL ILLUSTRATION"
+                      draw.text((1462, 116), label, font=font, fill=(240, 243, 248))
                       generated.save(path, "JPEG", quality=88)
                       return True
                   except Exception as exc:
                       print(f"Gemini image fallback attempt {attempt + 1} failed: {exc}")
                       time.sleep(5)
+              return False
+
+          def wants_ai_first(asset_type, visual_subject, scene_title, passage_text):
+              if asset_type in {"ai_creature", "ai_reconstruction", "ai_atmosphere"}:
+                  return True
+              combined = " ".join([asset_type or "", visual_subject or "", scene_title or "", passage_text or ""]).lower()
+              trigger_terms = (
+                  "jersey devil", "mothman", "bigfoot", "skinwalker", "cryptid", "creature",
+                  "monster", "legend", "myth", "folklore", "demon", "alien", "ufo", "encounter",
+                  "alleged sighting", "witness claim", "terrifying figure", "strange being"
+              )
+              if any(term in combined for term in trigger_terms):
+                  return True
               return False
 
           attribution = []
@@ -1079,19 +1122,46 @@ jobs:
                   "story", "stories", "audiences", "people", "content", "channel", "channels"
               }
           
-          def scene_search_queries(search_query, scene_title, visual_subject, keyword):
+          def scene_search_queries(search_query, scene_title, visual_subject, keyword, asset_type="", must_show=""):
               ignored = tokens_ignored()
               subject_words = [word for word in re.findall(r"[a-z0-9]+", (visual_subject or "").lower()) if word not in ignored]
               keyword_words = [word for word in re.findall(r"[a-z0-9]+", (keyword or "").lower()) if word not in ignored]
               title_words = [word for word in re.findall(r"[a-z0-9]+", (scene_title or "").lower()) if word not in ignored]
-              variants = [
-                  search_query,
-                  visual_subject,
-                  scene_title,
-                  " ".join(subject_words[:5]),
-                  " ".join((keyword_words[:3] + subject_words[:3])),
-                  " ".join(title_words[:3] + subject_words[:3]),
-              ]
+              must_words = [word for word in re.findall(r"[a-z0-9]+", (must_show or "").lower()) if word not in ignored]
+              base_subject = " ".join(subject_words[:5]).strip()
+              variants = [search_query, visual_subject, scene_title, base_subject]
+              if asset_type == "real_location":
+                  variants.extend([
+                      f"{base_subject} entrance" if base_subject else "",
+                      f"{base_subject} sign" if base_subject else "",
+                      f"{base_subject} gate" if base_subject else "",
+                      f"{base_subject} aerial" if base_subject else "",
+                  ])
+              elif asset_type == "real_document":
+                  variants.extend([
+                      f"{base_subject} newspaper" if base_subject else "",
+                      f"{base_subject} poster" if base_subject else "",
+                      f"{base_subject} transcript" if base_subject else "",
+                      f"{base_subject} sketch" if base_subject else "",
+                  ])
+              elif asset_type == "map_or_archive":
+                  variants.extend([
+                      f"{base_subject} map" if base_subject else "",
+                      f"{base_subject} archive" if base_subject else "",
+                      f"{base_subject} historical illustration" if base_subject else "",
+                  ])
+              elif asset_type == "real_object":
+                  variants.extend([
+                      f"{base_subject} damage" if base_subject else "",
+                      f"{base_subject} evidence" if base_subject else "",
+                      " ".join((must_words[:4] or subject_words[:4])),
+                  ])
+              else:
+                  variants.extend([
+                      " ".join((keyword_words[:3] + subject_words[:3])),
+                      " ".join(title_words[:3] + subject_words[:3]),
+                      " ".join((must_words[:4] or subject_words[:4])),
+                  ])
               result = []
               seen = set()
               for value in variants:
@@ -1100,7 +1170,7 @@ jobs:
                   if len(tokens(value)) >= 2 and key_value not in seen:
                       result.append(value)
                       seen.add(key_value)
-              return result[:3]  # Seek more exact visual anchors before settling for fallback.
+              return result[:5]  # Seek multiple exact anchor variants before settling for fallback.
           
           def download_candidate(candidate):
               request = urllib.request.Request(
@@ -1185,53 +1255,97 @@ jobs:
               visual_subject = clean_text(planned.get("visual_subject", ""))
               visual_intent = clean_text(planned.get("visual_intent", ""))
               search_query = clean_text(planned.get("query", ""))
+              asset_type = clean_text(planned.get("asset_type", "contextual_broll")).lower() or "contextual_broll"
+              priority = clean_text(planned.get("priority", "support")).lower() or "support"
+              must_show = clean_text(planned.get("must_show", ""))
               if len(tokens(visual_subject)) < 2:
                   visual_subject = scene_title if len(tokens(scene_title)) >= 2 else keyword
               if len(tokens(keyword)) < 1:
                   keyword = visual_subject
               if len(tokens(search_query)) < 2:
                   search_query = visual_subject
-              queries = scene_search_queries(search_query, scene_title, visual_subject, keyword)
-              print(f"Scene {scene_index:02d} subject '{visual_subject}' image search queries: {queries}")
-              candidate_pool = []
-              for query_index, candidate_query in enumerate(queries, start=1):
-                  try:
-                      candidates = image_candidates(candidate_query)
-                      candidate_pool.extend(candidates)
-                      if candidates:
-                          print(f"Found {len(candidates)} candidates for '{candidate_query}'.")
-                  except Exception as error:
-                      print(f"Image search failed for scene {scene_index}, query '{candidate_query}': {error}")
-                  if query_index < len(queries):
-                      time.sleep(1.5)
-          
-              deduplicated = {}
-              for candidate in candidate_pool:
-                  title_key = candidate.get("title", "").casefold()
-                  if title_key and (title_key not in deduplicated or candidate.get("match_score", 0) > deduplicated[title_key].get("match_score", 0)):
-                      deduplicated[title_key] = candidate
-              candidate_pool = list(deduplicated.values())
-              subject_tokens = tokens(visual_subject + " " + scene_title + " " + keyword)
-              for candidate in candidate_pool:
-                  candidate_tokens = tokens(candidate.get("searchable_text", "") + " " + candidate.get("title", ""))
-                  overlap = len(subject_tokens & candidate_tokens)
-                  candidate["semantic_score"] = overlap / max(1, len(subject_tokens))
-              candidate_pool.sort(key=lambda item: (item.get("semantic_score", 0), item.get("match_score", 0)), reverse=True)
-              plausible = [candidate for candidate in candidate_pool if candidate.get("semantic_score", 0) >= 0.08 or candidate.get("match_score", 0) >= 0.35]
-              selected = judge_visual_relevance(passage["text"], scene_title, visual_subject, plausible[:3]) if plausible else None
-          
-              if selected:
-                  filename = f"image-{scene_index}.jpg"
-                  (images / filename).write_bytes(selected.pop("_image_bytes"))
-                  selected["file"] = filename
-                  selected["scene"] = scene_index
-                  selected["search_query"] = search_query
-                  selected["visual_subject"] = visual_subject
-                  selected["visual_intent"] = visual_intent
-                  used_titles.add(selected["title"])
-                  print(f"Accepted visually checked image for scene {scene_index:02d}: {selected['title']} (confidence {selected.get('visual_confidence', 0):.2f})")
-              else:
-                  filename = f"image-{scene_index}.jpg"
+              queries = scene_search_queries(search_query, scene_title, visual_subject, keyword, asset_type, must_show)
+              print(f"Scene {scene_index:02d} asset_type={asset_type} priority={priority} subject '{visual_subject}' image search queries: {queries}")
+
+              selected = None
+              filename = f"image-{scene_index}.jpg"
+              ai_first = wants_ai_first(asset_type, visual_subject, scene_title, passage["text"])
+              if ai_first:
+                  print(f"Scene {scene_index:02d} prefers AI-led hero visual.")
+                  if generate_illustration(
+                      images / filename, scene_title, visual_subject, passage["text"],
+                      asset_type=asset_type, must_show=must_show, priority=priority,
+                  ):
+                      selected = {
+                          "url": "", "title": visual_subject or scene_title,
+                          "creator": "Signal Brief / Gemini", "license": "AI-generated illustration",
+                          "license_url": "", "foreign_landing_url": "",
+                          "attribution": "AI-generated editorial reconstruction/illustration selected intentionally for a scene without a trustworthy exact photo",
+                          "match_score": 0, "file": filename, "scene": scene_index,
+                          "search_query": search_query, "visual_subject": visual_subject,
+                          "visual_intent": visual_intent, "visual_confidence": 0.82,
+                          "reused_fallback": False, "asset_type": asset_type,
+                      }
+                      print(f"Generated intentional AI hero visual for scene {scene_index:02d}: {visual_subject}")
+
+              if not selected:
+                  candidate_pool = []
+                  for query_index, candidate_query in enumerate(queries, start=1):
+                      try:
+                          candidates = image_candidates(candidate_query)
+                          candidate_pool.extend(candidates)
+                          if candidates:
+                              print(f"Found {len(candidates)} candidates for '{candidate_query}'.")
+                      except Exception as error:
+                          print(f"Image search failed for scene {scene_index}, query '{candidate_query}': {error}")
+                      if query_index < len(queries):
+                          time.sleep(1.5)
+
+                  deduplicated = {}
+                  for candidate in candidate_pool:
+                      title_key = candidate.get("title", "").casefold()
+                      if title_key and (title_key not in deduplicated or candidate.get("match_score", 0) > deduplicated[title_key].get("match_score", 0)):
+                          deduplicated[title_key] = candidate
+                  candidate_pool = list(deduplicated.values())
+                  subject_tokens = tokens(" ".join([visual_subject, scene_title, keyword, must_show]))
+                  for candidate in candidate_pool:
+                      candidate_tokens = tokens(candidate.get("searchable_text", "") + " " + candidate.get("title", ""))
+                      overlap = len(subject_tokens & candidate_tokens)
+                      candidate["semantic_score"] = overlap / max(1, len(subject_tokens))
+                  candidate_pool.sort(key=lambda item: (item.get("semantic_score", 0), item.get("match_score", 0)), reverse=True)
+                  plausible = [candidate for candidate in candidate_pool if candidate.get("semantic_score", 0) >= 0.08 or candidate.get("match_score", 0) >= 0.35]
+                  selected = judge_visual_relevance(passage["text"], scene_title, visual_subject, plausible[:3]) if plausible else None
+
+                  if selected:
+                      (images / filename).write_bytes(selected.pop("_image_bytes"))
+                      selected["file"] = filename
+                      selected["scene"] = scene_index
+                      selected["search_query"] = search_query
+                      selected["visual_subject"] = visual_subject
+                      selected["visual_intent"] = visual_intent
+                      selected["asset_type"] = asset_type
+                      used_titles.add(selected["title"])
+                      print(f"Accepted visually checked image for scene {scene_index:02d}: {selected['title']} (confidence {selected.get('visual_confidence', 0):.2f})")
+
+              if not selected and enable_ai_images:
+                  ai_type = asset_type if asset_type in {"ai_creature", "ai_reconstruction", "ai_atmosphere"} else "ai_reconstruction"
+                  if generate_illustration(
+                      images / filename, scene_title, visual_subject, passage["text"],
+                      asset_type=ai_type, must_show=must_show, priority=priority,
+                  ):
+                      selected = {
+                          "url": "", "title": visual_subject or scene_title,
+                          "creator": "Signal Brief / Gemini", "license": "AI-generated illustration",
+                          "license_url": "", "foreign_landing_url": "",
+                          "attribution": "AI-generated editorial reconstruction/illustration used because no strong exact visual was found",
+                          "match_score": 0, "file": filename, "scene": scene_index,
+                          "search_query": search_query, "visual_subject": visual_subject,
+                          "visual_intent": visual_intent, "visual_confidence": 0.72,
+                          "reused_fallback": False, "asset_type": ai_type,
+                      }
+                      print(f"Visual fallback: generated AI illustration for scene {scene_index:02d} after weak search results.")
+
+              if not selected:
                   fallback_title = visual_subject or scene_title or topic or "Investigation context"
                   make_context_card(images / filename, fallback_title, passage["text"])
                   selected = {
@@ -1242,10 +1356,11 @@ jobs:
                       "match_score": 0, "file": filename, "scene": scene_index,
                       "search_query": "No candidate passed visual relevance check; original explanatory graphic used",
                       "visual_subject": visual_subject, "visual_intent": visual_intent,
-                      "visual_confidence": 0, "reused_fallback": True
+                      "visual_confidence": 0, "reused_fallback": True,
+                      "asset_type": asset_type,
                   }
                   print(f"WARNING: no candidate passed visual relevance check for scene {scene_index:02d}; using an original explanatory graphic rather than an unrelated photo.")
-          
+
               attribution.append(selected)
               visual_kind = "licensed_image" if selected.get("license") != "Original graphic" else "original_graphic"
           
