@@ -55,7 +55,7 @@ jobs:
           PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
           PIXABAY_API_KEY: ${{ secrets.PIXABAY_API_KEY }}
           ENABLE_AI_IMAGES: "true"  # Gemini AI visuals are ON by default for creature reconstructions and missing exact visuals.
-          MAX_AI_IMAGES_PER_VIDEO: "24"
+          MAX_AI_IMAGES_PER_VIDEO: "12"  # Cost control: max 12 generated images per video
           PUBLISH_SLOT: ${{ inputs.publish_slot || 'private' }}
         run: |
           set -euo pipefail
@@ -1031,81 +1031,85 @@ jobs:
               print(f"Image search {search_query!r}: {len(stock_cache[cache_key])} candidates by source {by_source}")
               return stock_cache[cache_key]
 
-          # Gemini image generation for scenes that need a deliberate editorial reconstruction.
+          # Image generation: use documented production models, handle errors transparently.
+          # Generated reconstructions are labelled and are never presented as evidence.
+          ai_attempts_used = 0
+          ai_model_enabled = True
           def generate_illustration(path, scene_title, visual_subject, passage_text, asset_type="", must_show="", priority=""):
-              if not enable_ai_images:
+              global ai_attempts_used, ai_model_enabled
+              if not enable_ai_images or not ai_model_enabled or ai_attempts_used >= max_ai_images:
                   return False
               from PIL import ImageOps, ImageDraw, ImageFont
               style_hint = {
-                  "ai_creature": "Show the creature clearly as the hero of the frame in a cinematic documentary style.",
-                  "ai_reconstruction": "Create a dramatic but believable reconstruction of the alleged encounter, clearly editorial rather than evidentiary.",
-                  "ai_atmosphere": "Create a strong atmospheric establishing shot tied closely to the subject and location.",
-              }.get(asset_type, "Create a cinematic editorial illustration.")
+                  "ai_creature": "Show the legendary creature clearly in a cinematic editorial reconstruction.",
+                  "ai_reconstruction": "Illustrate the alleged scene as an editorial reconstruction, never as actual evidence.",
+                  "ai_atmosphere": "Make a cinematic establishing shot specific to the topic and location.",
+              }.get(asset_type, "Create a strong, story-specific cinematic documentary illustration.")
               prompt = (
-                  "Create a landscape 16:9 editorial image for a YouTube documentary. "
-                  "Think like a human editor choosing a powerful hero visual, not generic filler. "
-                  "This image must feel specific to the story and visually memorable. "
-                  "Never impersonate a real news screenshot, fabricate documents, or pretend the image is evidence. "
-                  "If the topic is legendary or disputed, make that clear through a reconstruction or atmospheric editorial style. "
-                  f"{style_hint} "
-                  "No on-image text, no logos, no watermark. "
-                  f"Investigation: {topic[:160]}. Scene title: {scene_title[:150]}. "
-                  f"Visual subject: {visual_subject[:180]}. Priority: {priority[:30]}. Asset type: {asset_type[:40]}. "
-                  f"Must show: {must_show[:200]}. Narration context: {passage_text[:320]}"
+                  "Create one 16:9 landscape editorial illustration for a mystery documentary. "
+                  "Make the MAIN SUBJECT prominent and instantly recognisable. Avoid generic filler. "
+                  "Do not fabricate photos of real evidence, authentic transcripts, documents or eyewitness proof. "
+                  "No text, watermark or logos. "
+                  f"{style_hint} Investigation: {topic[:160]}. "
+                  f"Scene: {scene_title[:150]}. Subject: {visual_subject[:180]}. "
+                  f"Specific details to show: {must_show[:230]}. Narration: {passage_text[:320]}"
               )
-              for attempt in range(2):
-                  try:
-                      response = requests.post(
-                          "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite-image:generateContent",
-                          headers={"x-goog-api-key": key, "Content-Type": "application/json"},
-                          json={
-                              "contents": [{"parts": [{"text": prompt}]}],
-                              "generationConfig": {
-                                  "responseModalities": ["IMAGE"],
-                                  "responseFormat": {"image": {"aspectRatio": "16:9"}},
+              # One generated image per eligible call, including unsuccessful attempts,
+              # so an unavailable or unbillable model cannot trigger dozens of charges.
+              ai_attempts_used += 1
+              models = ("gemini-3.1-flash-image", "gemini-2.5-flash-image")
+              for model in models:
+                  for attempt in range(2):
+                      try:
+                          response = requests.post(
+                              f"https://generativelanguage.googleapis.com/v1/models/{model}:generateContent",
+                              headers={"x-goog-api-key": key, "Content-Type": "application/json"},
+                              json={
+                                  "contents": [{"parts": [{"text": prompt}]}],
+                                  "generationConfig": {
+                                      "responseModalities": ["IMAGE"],
+                                      "responseFormat": {"image": {"aspectRatio": "16:9"}},
+                                  },
                               },
-                          },
-                          timeout=(20, 150),
-                      )
-                      if response.status_code == 429 or response.status_code >= 500:
-                          time.sleep(10 * (attempt + 1))
-                          continue
-                      response.raise_for_status()
-                      parts = response.json().get("candidates", [{}])[0].get("content", {}).get("parts", [])
-                      encoded = next(
-                          (part["inlineData"]["data"] for part in parts if part.get("inlineData", {}).get("data")),
-                          None,
-                      )
-                      if not encoded:
-                          print(f"Gemini image returned no image for {scene_title!r}")
-                          return False
-                      generated = Image.open(io.BytesIO(base64.b64decode(encoded))).convert("RGB")
-                      generated = ImageOps.fit(generated, (1920, 1080), method=Image.Resampling.LANCZOS)
-                      draw = ImageDraw.Draw(generated)
-                      font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
-                      font = ImageFont.truetype(font_path, 25)
-                      draw.rounded_rectangle((1440, 100, 1870, 165), radius=10, fill=(15, 18, 25))
-                      label = "EDITORIAL RECONSTRUCTION" if asset_type in {"ai_creature", "ai_reconstruction"} else "EDITORIAL ILLUSTRATION"
-                      draw.text((1462, 116), label, font=font, fill=(240, 243, 248))
-                      generated.save(path, "JPEG", quality=88)
-                      return True
-                  except Exception as exc:
-                      print(f"Gemini image fallback attempt {attempt + 1} failed: {exc}")
-                      time.sleep(5)
+                              timeout=(20, 150),
+                          )
+                          if not response.ok:
+                              # Google JSON error body reveals unsupported params, billing or quota.
+                              print(f"IMAGE_API_ERROR model={model} status={response.status_code} body={response.text[:1400]}")
+                              if response.status_code in (400, 401, 403, 404):
+                                  break
+                              if response.status_code == 429:
+                                  print("Image quota reached; disabling additional AI requests for this run.")
+                                  ai_model_enabled = False
+                                  return False
+                              if response.status_code >= 500 and attempt == 0:
+                                  time.sleep(5)
+                                  continue
+                              break
+                          parts = response.json().get("candidates", [{}])[0].get("content", {}).get("parts", [])
+                          encoded = next((part.get("inlineData", part.get("inline_data", {})).get("data") for part in parts
+                                          if part.get("inlineData", part.get("inline_data", {})).get("data")), None)
+                          if not encoded:
+                              print(f"Image model {model} returned no image. Response: {response.text[:800]}")
+                              break
+                          generated = Image.open(io.BytesIO(base64.b64decode(encoded))).convert("RGB")
+                          generated = ImageOps.fit(generated, (1920, 1080), method=Image.Resampling.LANCZOS)
+                          draw = ImageDraw.Draw(generated)
+                          font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 19)
+                          label = "EDITORIAL RECONSTRUCTION" if asset_type in {"ai_creature", "ai_reconstruction"} else "AI ILLUSTRATION"
+                          draw.rounded_rectangle((1520, 96, 1875, 146), radius=10, fill=(13, 16, 23))
+                          draw.text((1532, 112), label, font=font, fill="white")
+                          generated.save(path, "JPEG", quality=90)
+                          print(f"Generated image with {model} for scene: {scene_title}")
+                          return True
+                      except (requests.exceptions.RequestException, ValueError, OSError) as exc:
+                          print(f"IMAGE_API_EXCEPTION model={model}: {exc}")
+                          break
+              print("AI image unavailable for this scene; continuing with licensed visual search.")
               return False
 
           def wants_ai_first(asset_type, visual_subject, scene_title, passage_text):
-              if asset_type in {"ai_creature", "ai_reconstruction", "ai_atmosphere"}:
-                  return True
-              combined = " ".join([asset_type or "", visual_subject or "", scene_title or "", passage_text or ""]).lower()
-              trigger_terms = (
-                  "jersey devil", "mothman", "bigfoot", "skinwalker", "cryptid", "creature",
-                  "monster", "legend", "myth", "folklore", "demon", "alien", "ufo", "encounter",
-                  "alleged sighting", "witness claim", "terrifying figure", "strange being"
-              )
-              if any(term in combined for term in trigger_terms):
-                  return True
-              return False
+              return asset_type in {"ai_creature", "ai_reconstruction", "ai_atmosphere"}
 
           attribution = []
           scene_manifest = []
