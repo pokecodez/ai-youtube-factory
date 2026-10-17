@@ -509,20 +509,23 @@ jobs:
               )
           
           script = re.sub(r"^\s*I am Signal Brief, and I will be discussing [^.]+\.\s*", "", script, flags=re.IGNORECASE).strip()
-          # Open with the story hook, then a SHORT recognisable channel ident.
-          # Inserting it into the narrated text (before TTS and caption alignment)
-          # keeps spoken audio, subtitles and scene timings in sync.
+          # Full audible introduction and outro, inserted BEFORE TTS, transcription,
+          # scene matching and caption creation so everything stays in sync.
           hook_match = re.search(r"[.!?](?:[\"'”’])?(?=\s|$)", script)
           if hook_match:
               cut = hook_match.end()
               hook, rest = script[:cut].strip(), script[cut:].strip()
-              script = hook + "\n\nYou're watching Signal Brief. Let's follow the evidence.\n\n" + rest
           else:
-              script += "\n\nYou're watching Signal Brief. Let's follow the evidence."
-          # An outro at the actual end of narration, not a silent extra video segment.
-          script += ("\n\nThat's the evidence so far. This is Signal Brief. "
-                     "For more investigations that separate fact from fiction, "
-                     "subscribe, and I'll see you in the next one.")
+              hook, rest = script[:180].strip(), script[180:].strip()
+          channel_intro = ("This is Signal Brief. Every mystery has a story, "
+                           "but not every story has evidence. "
+                           "Let's find out what really happened.")
+          channel_outro = ("And that brings us to the end of this investigation. "
+                           "What do you think explains it? Tell me in the comments. "
+                           "If you enjoyed this deep dive, subscribe to Signal Brief "
+                           "for more strange stories, fascinating mysteries and the evidence behind them. "
+                           "Thanks for watching, and I'll see you next time.")
+          script = hook + "\n\n" + channel_intro + "\n\n" + rest + "\n\n" + channel_outro
           word_count = len(script.split())
           (out / "script.txt").write_text(script, encoding="utf-8")
           print(f"Investigative narration generated: {word_count} words.")
@@ -596,7 +599,7 @@ jobs:
                   "speechConfig": {
                       "voiceConfig": {
                           "prebuiltVoiceConfig": {
-                              "voiceName": "Charon"
+                              "voiceName": "Kore"
                           }
                       }
                   }
@@ -642,6 +645,20 @@ jobs:
                   wav_file.writeframes(audio_bytes)
           
           print("Narration generated.")
+          # Gemini narration can sound unnaturally rushed. Stretch the completed
+          # speech slightly without changing pitch, BEFORE Whisper and timings.
+          # This also ensures video transitions, captions and music match the audio.
+          raw_narration = out / "narration-raw.wav"
+          processed_narration = out / "narration-paced.wav"
+          (out / "narration.wav").replace(raw_narration)
+          subprocess.run([
+              "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+              "-i", str(raw_narration), "-af", "atempo=0.88",
+              "-ar", "24000", "-ac", "1", str(processed_narration)
+          ], check=True)
+          processed_narration.replace(out / "narration.wav")
+          print("Female Kore narration paced to 88% of the original speaking speed.")
+
           
           
           visual_prompt = f"""You are the visual researcher and editor for a modern, high-quality investigative YouTube documentary for SIGNAL BRIEF.
@@ -1866,7 +1883,7 @@ jobs:
           out = Path("output")
           scenes = json.loads((out / "scene-timings.json").read_text(encoding="utf-8"))
           duration = float((out / "duration.txt").read_text().strip())
-          transition = 0.65
+          transition = 0.85
           command = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y"]
 
           for index, scene in enumerate(scenes):
@@ -1925,15 +1942,15 @@ jobs:
               "drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:"
               "text='SIGNAL BRIEF':fontcolor=white:fontsize=76:"
               "x=(w-text_w)/2:y=(h-text_h)/2-35:"
-              "borderw=4:bordercolor=black@0.80:enable='between(t,0,3)',"
+              "borderw=4:bordercolor=black@0.80:enable='between(t,5,11)',"
               "drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf:"
               "text='THE CLAIM. THE EVIDENCE. THE TRUTH.':"
               "fontcolor=white:fontsize=31:x=(w-text_w)/2:y=(h-text_h)/2+60:"
-              "borderw=3:bordercolor=black@0.8:enable='between(t,0,3)',"
+              "borderw=3:bordercolor=black@0.8:enable='between(t,5,11)',"
               "drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:"
               "text='SUBSCRIBE FOR MORE INVESTIGATIONS':"
               "fontcolor=white:fontsize=46:x=(w-text_w)/2:y=(h-text_h)/2:"
-              f"borderw=4:bordercolor=black@0.8:enable='gte(t,{max(0.0, duration-5.0):.3f})'"
+              f"borderw=4:bordercolor=black@0.8:enable='gte(t,{max(0.0, duration-12.0):.3f})'"
               "[branded]"
           )
           filters.append(
@@ -1978,7 +1995,7 @@ jobs:
               str(out / "signal-brief.mp4")
           ])
 
-          print(f"Rendering {len(scenes)} fast-cut, narration-matched scenes with persistent SIGNAL BRIEF branding, narration-aligned subtitles, and background music.")
+          print(f"Rendering {len(scenes)} paced, narration-matched scenes with persistent SIGNAL BRIEF branding, narration-aligned subtitles, and background music.")
           subprocess.run(command, check=True)
           print("Cinematic edit completed.")
           PY
