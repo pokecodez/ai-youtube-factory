@@ -49,7 +49,48 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install --quiet requests pillow "av==14.2.0" "faster-whisper==1.1.1" --only-binary=av
 
+      - name: Check YouTube access before generating paid assets
+        env:
+          YOUTUBE_CLIENT_ID: ${{ secrets.YOUTUBE_CLIENT_ID }}
+          YOUTUBE_CLIENT_SECRET: ${{ secrets.YOUTUBE_CLIENT_SECRET }}
+          YOUTUBE_REFRESH_TOKEN: ${{ secrets.YOUTUBE_REFRESH_TOKEN }}
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet google-auth
+          python - <<'PY_AUTH'
+          import os
+          from google.oauth2.credentials import Credentials
+          from google.auth.transport.requests import Request
+          from google.auth.exceptions import RefreshError
+
+          required = ("YOUTUBE_CLIENT_ID", "YOUTUBE_CLIENT_SECRET", "YOUTUBE_REFRESH_TOKEN")
+          missing = [name for name in required if not os.environ.get(name)]
+          if missing:
+              raise SystemExit("Missing GitHub Actions secrets: " + ", ".join(missing))
+          creds = Credentials(
+              token=None,
+              refresh_token=os.environ["YOUTUBE_REFRESH_TOKEN"],
+              token_uri="https://oauth2.googleapis.com/token",
+              client_id=os.environ["YOUTUBE_CLIENT_ID"],
+              client_secret=os.environ["YOUTUBE_CLIENT_SECRET"],
+              scopes=["https://www.googleapis.com/auth/youtube.upload"],
+          )
+          try:
+              creds.refresh(Request())
+          except RefreshError as error:
+              raise SystemExit(
+                  "YouTube authorization FAILED before video generation. "
+                  "The Google OAuth refresh token was rejected. Re-authorize the YouTube channel "
+                  "with the matching OAuth client and update YOUTUBE_REFRESH_TOKEN "
+                  "(also CLIENT_ID/SECRET if you created a new client). "
+                  "Check that the Google OAuth consent screen is not in Testing mode. "
+                  f"Google error: {str(error)[:200]}"
+              ) from None
+          print("YouTube OAuth refresh successful; video generation can begin.")
+          PY_AUTH
+
       - name: Research category documentary, narrate and match visuals
+        id: research
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
@@ -223,44 +264,76 @@ jobs:
                       for article in related[:5]]})
           if not candidate_records:
               raise SystemExit("Not enough researched candidate subjects; skip upload.")
-          editor_prompt = f"""You are a highly selective YouTube documentary commissioning editor.
-          This publishing slot covers ONLY: {category}.
-          Choose one BROAD, SELF-CONTAINED documentary subject from the research leads.
-          A video should fully introduce and explore a mystery, creature, case or phenomenon,
-          not be an obscure micro-update, random person's statement or episode on one tiny detail.
-          Prioritise immediate curiosity, recognisable visual anchors, real reusable location/object
-          photos, records and maps, investigative depth, and a compelling hook to strangers.
-          Consider present-day YouTube audience appeal without pretending to have view-count data.
-          Avoid politics as routine news, cheap allegations, filler, and celebrity gossip.
-          Keep claims distinct from evidence; do not present legends as fact.
-          HISTORY of already published subjects (DO NOT repeat any overall subject, spelling variants,
-          sequels, updates or closely related subtopics): {json.dumps(previous_topics[-250:])}
-          Candidate leads with verifiable background reports: {json.dumps(candidate_records, ensure_ascii=False)[:28000]}
-          Return ONLY JSON: {{"lead":"exact lead from supplied list","topic":"short whole-subject documentary topic","reason":"one sentence"}}.
-          If none is strong and genuinely distinct return {{"lead":null,"topic":null,"reason":"..."}}."""
-          response = gemini_post(
-              "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent",
-              headers={"x-goog-api-key": key},
-              json={"contents": [{"parts": [{"text": editor_prompt}]}],
-                    "generationConfig": {"temperature": 0.25, "maxOutputTokens": 400,
-                                         "responseMimeType": "application/json"}})
-          response.raise_for_status()
-          editor_text = "".join(x.get("text", "") for x in response.json()["candidates"][0]["content"]["parts"])
-          chosen = json.loads(editor_text)
-          chosen_lead = chosen.get("lead")
-          if chosen_lead not in {x["lead"] for x in candidate_records}:
-              raise SystemExit("Editorial check declined an eligible whole-topic documentary.")
-          topic = re.sub(r"\s+", " ", str(chosen.get("topic") or chosen_lead)).strip()[:115]
-          if len(topic) < 7:
-              raise SystemExit("Invalid documentary subject.")
+          # Try several well-researched leads rather than ending the whole run when
+          # the first AI proposal duplicates an already uploaded documentary.
           def subject_tokens(value):
               return {x for x in re.findall(r"[a-z0-9]+", value.lower()) if len(x) > 3 and x not in
                       {"video", "investigation", "mystery", "explained", "evidence", "really", "about", "theory"}}
-          new_tokens = subject_tokens(topic + " " + chosen_lead)
-          for old in previous_topics:
-              old_tokens = subject_tokens(old)
-              if old_tokens and (len(new_tokens & old_tokens) / max(1, min(len(new_tokens),len(old_tokens))) > .64):
-                  raise SystemExit(f"Already covered a related whole subject: {old}")
+
+          def previous_subject_match(topic_candidate, candidate_lead):
+              new_tokens = subject_tokens(topic_candidate + " " + candidate_lead)
+              for old in previous_topics:
+                  old_tokens = subject_tokens(old)
+                  if old_tokens and len(new_tokens & old_tokens) / max(1, min(len(new_tokens), len(old_tokens))) > 0.64:
+                      return old
+              return None
+
+          remaining_candidates = list(candidate_records)
+          selected = None
+          # Six independent suggestions; remove rejected research leads each time.
+          for attempt in range(min(6, len(remaining_candidates))):
+              editor_prompt = f"""You are a highly selective YouTube documentary commissioning editor.
+          This publishing slot covers ONLY: {category}.
+          Choose one BROAD, SELF-CONTAINED documentary subject from the supplied research leads.
+          Each video must fully explore a whole mystery, creature, case or phenomenon, not
+          an obscure micro-update or a short episode about one insignificant detail.
+          Prioritise recognisable visual anchors, verifiable reporting and investigative depth.
+          Avoid routine politics, unsupported accusations, and sensationalist invented evidence.
+          Do not repeat ANY previously published whole subject, variant, sequel or closely
+          related subtopic. Previously uploaded topics: {json.dumps(previous_topics[-500:])}
+          Available research-backed leads (only these are eligible):
+          {json.dumps(remaining_candidates, ensure_ascii=False)[:28000]}
+          Return ONLY JSON: {{"lead":"exact lead from supplied list","topic":"whole-subject documentary topic","reason":"one sentence"}}.
+          If none is sufficiently supported and distinct, return {{"lead":null,"topic":null,"reason":"..."}}."""
+              response = gemini_post(
+                  "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent",
+                  headers={"x-goog-api-key": key},
+                  json={"contents": [{"parts": [{"text": editor_prompt}]}],
+                        "generationConfig": {"temperature": 0.35 + attempt * 0.05,
+                                             "maxOutputTokens": 400,
+                                             "responseMimeType": "application/json"}})
+              response.raise_for_status()
+              editor_text = "".join(x.get("text", "") for x in response.json()["candidates"][0]["content"]["parts"])
+              try:
+                  chosen = json.loads(editor_text)
+              except (ValueError, TypeError):
+                  print(f"Editor proposal {attempt + 1} returned invalid JSON; trying another lead.")
+                  continue
+              chosen_lead = chosen.get("lead")
+              available_leads = {x["lead"] for x in remaining_candidates}
+              if chosen_lead not in available_leads:
+                  print(f"Editor proposal {attempt + 1}: no eligible topic returned; trying next proposal.")
+                  if remaining_candidates:
+                      # Avoid asking six times over identical input if nothing qualifies.
+                      break
+                  continue
+              topic = re.sub(r"\s+", " ", str(chosen.get("topic") or chosen_lead)).strip()[:115]
+              already = previous_subject_match(topic, chosen_lead)
+              if already or len(topic) < 7:
+                  print(f"Skipping already-covered or invalid topic {topic!r}: {already or 'invalid title'}")
+                  remaining_candidates = [entry for entry in remaining_candidates if entry["lead"] != chosen_lead]
+                  if not remaining_candidates:
+                      break
+                  continue
+              selected = (topic, chosen_lead)
+              print(f"Selected a new subject after {attempt + 1} editorial proposal(s): {topic}")
+              break
+
+          if selected is None:
+              print("SKIPPED: no genuinely new, research-backed whole-topic documentary was available in this slot.")
+              (out / "skip-video").write_text("No new eligible research-backed subject.\n", encoding="utf-8")
+              raise SystemExit(0)
+          topic, chosen_lead = selected
           # Read multiple pieces for the chosen WHOLE topic rather than only one headline.
           selected_articles = [x for x in research_items if x["lead"] == chosen_lead]
           news_items = sorted(selected_articles, key=lambda x: x["published_dt"], reverse=True)
@@ -657,7 +730,7 @@ jobs:
               "-ar", "24000", "-ac", "1", str(processed_narration)
           ], check=True)
           processed_narration.replace(out / "narration.wav")
-          print("Female Kore narration paced to 88% of the original speaking speed.")
+          print("Narration paced to 88% of the original speaking speed.")
 
           
           
@@ -1681,8 +1754,13 @@ jobs:
           PY
 
           python build.py
+          if [ -f output/skip-video ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "No fresh documentary is eligible today; skipping further steps without marking the run failed."
+          fi
 
       - name: Validate generated script, narration and images
+        if: steps.research.outputs.skip != 'true'
         run: |
           set -euo pipefail
 
@@ -1789,6 +1867,7 @@ jobs:
           PY
 
       - name: Create custom Signal Brief thumbnail
+        if: steps.research.outputs.skip != 'true'
         run: |
           set -euo pipefail
           python - <<'PY'
@@ -1898,6 +1977,7 @@ jobs:
           PY
 
       - name: Generate original procedural background music
+        if: steps.research.outputs.skip != 'true'
         run: |
           set -euo pipefail
 
@@ -1990,136 +2070,122 @@ jobs:
           print(f"Music duration: {duration:.1f} seconds.")
           PY
 
-      - name: Assemble MP4 with cinematic motion and crossfades
+      - name: Assemble MP4 reliably (small scene clips, not a giant filter graph)
+        if: steps.research.outputs.skip != 'true'
         run: |
           set -euo pipefail
 
-          python - <<'PY'
+          python - <<'PY_RENDER'
           import json
           import subprocess
           from pathlib import Path
 
           out = Path("output")
           scenes = json.loads((out / "scene-timings.json").read_text(encoding="utf-8"))
-          duration = float((out / "duration.txt").read_text().strip())
-          transition = 0.85
-          command = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y"]
+          duration = float((out / "duration.txt").read_text(encoding="utf-8").strip())
+          frames_per_second = 24
+          clips = out / "render-parts"
+          clips.mkdir(parents=True, exist_ok=True)
+          render_log = out / "render-log.txt"
+          render_log.write_text("Reliable per-scene rendering log\n", encoding="utf-8")
 
-          for index, scene in enumerate(scenes):
-              clip_duration = float(scene["duration"])
-              if index > 0:
-                  clip_duration += transition
-              command.extend([
-                  "-loop", "1",
-                  "-framerate", "24",
-                  "-t", f"{clip_duration:.4f}",
-                  "-i", str(out / "images" / scene["file"])
-              ])
-
-          narration_index = len(scenes)
-          music_index = len(scenes) + 1
-          command.extend(["-i", str(out / "narration.wav"), "-i", str(out / "background-music.wav")])
-
-          filters = []
-          for index, scene in enumerate(scenes):
-              clip_duration = float(scene["duration"]) + (transition if index > 0 else 0)
-              filters.append(
-                  f"[{index}:v]"
-                  "scale=2000:1125:force_original_aspect_ratio=increase,"
-                  "crop=2000:1125,"
-                  "zoompan=z='min(zoom+0.00065,1.10)':"
-                  "x='(iw-iw/zoom)/2+sin(on/95)*18':"
-                  "y='(ih-ih/zoom)/2+cos(on/115)*12':"
-                  "d=1:s=1920x1080:fps=24,"
-                  "setsar=1,format=yuv420p,settb=AVTB,setpts=PTS-STARTPTS,"
-                  f"trim=duration={clip_duration:.4f}[v{index}]"
+          def run_ffmpeg(args, label):
+              # Capture useful error output, not just an enormous command traceback.
+              process = subprocess.run(
+                  args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                  text=True, errors="replace", check=False
               )
-
-          if len(scenes) == 1:
-              current_video = "v0"
-          else:
-              current_video = "v0"
-              cumulative = float(scenes[0]["duration"])
-              for index in range(1, len(scenes)):
-                  next_label = f"xf{index}"
-                  offset = max(0.0, cumulative - transition)
-                  filters.append(
-                      f"[{current_video}][v{index}]"
-                      f"xfade=transition=fade:duration={transition:.3f}:offset={offset:.4f}"
-                      f"[{next_label}]"
+              with render_log.open("a", encoding="utf-8") as log:
+                  log.write(f"\n[{label}] exit={process.returncode}\n")
+                  log.write(process.stderr[-14000:] + "\n")
+              if process.returncode:
+                  excerpt = "\n".join(process.stderr.splitlines()[-35:])
+                  raise SystemExit(
+                      f"Video render failed at {label} (exit code {process.returncode}). "
+                      f"FFmpeg output:\n{excerpt}\nDetailed log: {render_log}"
                   )
-                  current_video = next_label
-                  cumulative += float(scenes[index]["duration"])
 
+          if not scenes:
+              raise SystemExit("Cannot render: scene-timings.json has no scenes.")
+
+          # Use cumulative frame boundaries so rounding errors do not build up.
+          frame_counts = []
+          elapsed = 0.0
+          previous_frame = 0
+          for scene in scenes:
+              elapsed += float(scene["duration"])
+              next_frame = round(elapsed * frames_per_second)
+              frame_counts.append(max(1, next_frame - previous_frame))
+              previous_frame = next_frame
+
+          concat_file = out / "scene-clips.ffconcat"
+          concat_lines = ["ffconcat version 1.0"]
+          for index, (scene, number_of_frames) in enumerate(zip(scenes, frame_counts), start=1):
+              image_path = out / "images" / scene["file"]
+              if not image_path.is_file() or image_path.stat().st_size < 1000:
+                  raise SystemExit(f"Missing or invalid image for scene {index}: {image_path}")
+              clip_path = clips / f"scene-{index:03d}.mp4"
+              print(f"Rendering scene {index}/{len(scenes)} ({number_of_frames} frames).", flush=True)
+              run_ffmpeg([
+                  "ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "error", "-y",
+                  "-loop", "1", "-framerate", str(frames_per_second),
+                  "-i", str(image_path),
+                  "-vf", (
+                      "scale=1280:720:force_original_aspect_ratio=increase,"
+                      "crop=1280:720,setsar=1,format=yuv420p,"
+                      "drawbox=x=0:y=0:w=iw:h=66:color=black@0.62:t=fill,"
+                      "drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:"
+                      "text='SIGNAL BRIEF':fontcolor=white:fontsize=28:x=42:y=17"
+                  ),
+                  "-frames:v", str(number_of_frames),
+                  "-an", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
+                  "-r", str(frames_per_second), "-pix_fmt", "yuv420p",
+                  "-threads", "2", str(clip_path)
+              ], f"scene {index}")
+              concat_lines.append(f"file 'render-parts/{clip_path.name}'")
+
+          concat_file.write_text("\n".join(concat_lines) + "\n", encoding="utf-8")
           fade_start = max(0.0, duration - 3.0)
-          filters.append(
-              f"[{current_video}]"
-              "drawbox=x=0:y=0:w=iw:h=96:color=black@0.62:t=fill,"
-              "drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:"
-              "text='SIGNAL BRIEF':fontcolor=white:fontsize=36:x=64:y=27:"
-              "borderw=1:bordercolor=black@0.7,"
-              "drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:"
-              "text='SIGNAL BRIEF':fontcolor=white:fontsize=76:"
-              "x=(w-text_w)/2:y=(h-text_h)/2-35:"
-              "borderw=4:bordercolor=black@0.80:enable='between(t,5,11)',"
-              "drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf:"
-              "text='THE CLAIM. THE EVIDENCE. THE TRUTH.':"
-              "fontcolor=white:fontsize=31:x=(w-text_w)/2:y=(h-text_h)/2+60:"
-              "borderw=3:bordercolor=black@0.8:enable='between(t,5,11)',"
-              "drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:"
-              "text='SUBSCRIBE FOR MORE INVESTIGATIONS':"
-              "fontcolor=white:fontsize=46:x=(w-text_w)/2:y=(h-text_h)/2:"
-              f"borderw=4:bordercolor=black@0.8:enable='gte(t,{max(0.0, duration-12.0):.3f})'"
-              "[branded]"
+          filters = (
+              "[0:v]subtitles=output/captions.srt:"
+              "force_style='FontName=DejaVu Sans,FontSize=20,Outline=2,Shadow=1,Alignment=2,MarginV=44'[video];"
+              "[1:a]aformat=sample_fmts=fltp:channel_layouts=stereo,volume=1.0[narration];"
+              f"[2:a]aformat=sample_fmts=fltp:channel_layouts=stereo,volume=0.24,"
+              f"afade=t=out:st={fade_start:.3f}:d=3[music];"
+              "[narration][music]amix=inputs=2:duration=first:dropout_transition=2[audio]"
           )
-          filters.append(
-              "[branded]subtitles=output/captions.srt:"
-              "force_style='FontName=Arial,FontSize=22,Outline=2,Shadow=1,Alignment=2,MarginV=55'"
-              "[video]"
-          )
-          # Normalise speech for consistent listening volume. Procedural synth music
-          # has low raw amplitude, so normalise its loudness BEFORE mixing.
-          # Side-chain ducking automatically softens music while narration speaks
-          # and lets it rise between sentences (including the intro/outro).
-          filters.append(
-              f"[{narration_index}:a]aformat=sample_fmts=fltp:channel_layouts=stereo,"
-              "loudnorm=I=-16:TP=-1.5:LRA=9,asplit=2[narration_mix][narration_duck]"
-          )
-          filters.append(
-              f"[{music_index}:a]aformat=sample_fmts=fltp:channel_layouts=stereo,"
-              "highpass=f=55,loudnorm=I=-22:TP=-3:LRA=9,volume=0.80,"
-              f"afade=t=in:st=0:d=1.5,afade=t=out:st={fade_start:.3f}:d=3[musicbed]"
-          )
-          filters.append(
-              "[musicbed][narration_duck]sidechaincompress=threshold=0.045:ratio=5:"
-              "attack=100:release=550:makeup=1[duckedmusic]"
-          )
-          filters.append(
-              "[narration_mix][duckedmusic]amix=inputs=2:duration=first:"
-              "dropout_transition=0:normalize=0,alimiter=limit=0.94[audio]"
-          )
-
-          command.extend([
-              "-filter_complex", ";".join(filters),
-              "-map", "[video]",
-              "-map", "[audio]",
-              "-c:v", "libx264",
-              "-preset", "ultrafast",
-              "-crf", "22",
-              "-r", "24",
-              "-c:a", "aac",
-              "-b:a", "160k",
-              "-t", f"{duration:.3f}",
-              "-movflags", "+faststart",
+          print("Combining scene clips, aligned subtitles, narration and background music.", flush=True)
+          run_ffmpeg([
+              "ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "error", "-y",
+              "-f", "concat", "-safe", "0", "-i", str(concat_file),
+              "-i", str(out / "narration.wav"),
+              "-i", str(out / "background-music.wav"),
+              "-filter_complex", filters,
+              "-map", "[video]", "-map", "[audio]",
+              "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+              "-r", str(frames_per_second), "-pix_fmt", "yuv420p",
+              "-c:a", "aac", "-b:a", "160k", "-threads", "2",
+              "-t", f"{duration:.3f}", "-movflags", "+faststart",
               str(out / "signal-brief.mp4")
-          ])
+          ], "final assembly")
+          print("Reliable video rendering completed successfully.")
+          # Only keep the final video, not dozens of intermediate clips.
+          import shutil
+          shutil.rmtree(clips, ignore_errors=True)
+          concat_file.unlink(missing_ok=True)
+          PY_RENDER
 
-          print(f"Rendering {len(scenes)} paced, narration-matched scenes with persistent SIGNAL BRIEF branding, narration-aligned subtitles, and background music.")
-          subprocess.run(command, check=True)
-          print("Cinematic edit completed.")
-          PY
+      - name: Upload render diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: signal-brief-render-debug
+          path: output/render-log.txt
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Validate final video
+        if: steps.research.outputs.skip != 'true'
         run: |
           set -euo pipefail
 
@@ -2153,6 +2219,7 @@ jobs:
           ffmpeg -v error -i "$video" -f null -
 
       - name: Upload video to YouTube and schedule release
+        if: steps.research.outputs.skip != 'true'
         env:
           YOUTUBE_CLIENT_ID: ${{ secrets.YOUTUBE_CLIENT_ID }}
           YOUTUBE_CLIENT_SECRET: ${{ secrets.YOUTUBE_CLIENT_SECRET }}
@@ -2320,15 +2387,22 @@ jobs:
           video_id = response.get("id")
           if not video_id:
               raise SystemExit("YouTube did not return a video ID.")
+          print("YouTube VIDEO UPLOADED: https://studio.youtube.com/video/" + video_id + "/edit")
 
           thumbnail_path = out / "thumbnail.jpg"
           if not thumbnail_path.is_file() or thumbnail_path.stat().st_size == 0:
               raise SystemExit("Custom thumbnail is missing; refusing to report a complete upload.")
-          youtube.thumbnails().set(
-              videoId=video_id,
-              media_body=MediaFileUpload(str(thumbnail_path), mimetype="image/jpeg"),
-          ).execute()
-          print("Custom Signal Brief thumbnail uploaded successfully.")
+          try:
+              youtube.thumbnails().set(
+                  videoId=video_id,
+                  media_body=MediaFileUpload(str(thumbnail_path), mimetype="image/jpeg"),
+              ).execute()
+              print("Custom Signal Brief thumbnail uploaded successfully.")
+          except Exception as error:
+              # The video is ALREADY uploaded; don't report the entire job as failed,
+              # or lose the successful subject from topic history, just for a thumbnail.
+              print(f"WARNING: video upload succeeded but custom thumbnail failed: {error}")
+              print("Review the video in YouTube Studio to set its thumbnail manually.")
           if scheduled_publish_at:
               print("Upload complete. Video is scheduled; confirm its release time in YouTube Studio.")
           else:
@@ -2364,6 +2438,7 @@ jobs:
           PY
 
       - name: Upload finished video and source files
+        if: steps.research.outputs.skip != 'true'
         uses: actions/upload-artifact@v4
         with:
           name: signal-brief-video
